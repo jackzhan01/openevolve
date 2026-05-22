@@ -9,7 +9,7 @@ import torch
 
 
 # EVOLVE-BLOCK-START
-from backward_naive_triton import layernorm_backward_naive_triton as _seed_backward
+from backward_atenir import layernorm_backward_triton as _seed_backward
 # EVOLVE-BLOCK-END
 
 
