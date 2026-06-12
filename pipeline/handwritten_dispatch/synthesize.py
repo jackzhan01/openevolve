@@ -13,9 +13,12 @@ context for the LLM kernel fusion step.
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import json
+import re as _re
 import subprocess
+import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,11 +75,100 @@ def _extract_graph(config: HandwrittenDispatchConfig) -> Path:
 
 # ── context generation ────────────────────────────────────────────────────────
 
+_TRITON_SUBMODULES = ("elementwise", "reduction", "gemm", "scatter_gather")
 
-def generate_dispatch_context(graph_path: Path, max_source_chars: int = 500) -> str:
+
+def _get_triton_source(kernel) -> tuple[str, str]:
+    """Return (dedup_key, source_text) for a kernel from make_registry.
+
+    Direct Triton module functions  → full function source via inspect.getsource.
+    Factory-returned closures       → factory source + referenced helpers (2 levels deep),
+                                      surfacing the actual @triton.jit kernel bodies.
+    Dispatch.py closures            → closure source (thin wrapper, still informative).
+    """
+    module_name = getattr(kernel, "__module__", "") or ""
+    qualname = getattr(kernel, "__qualname__", "") or ""
+
+    if any(m in module_name for m in _TRITON_SUBMODULES):
+        try:
+            mod = sys.modules.get(module_name) or importlib.import_module(module_name)
+        except ImportError:
+            mod = None
+
+        if "<locals>" in qualname and mod is not None:
+            # Factory-returned closure (e.g. make_sum_kernel.<locals>.triton_sum).
+            # Show the factory definition + all _*-named helpers it transitively calls,
+            # which surfaces the @triton.jit kernel bodies.
+            factory_name = qualname.split(".<locals>")[0]
+            dedup_key = f"{module_name}.{factory_name}"
+            factory_fn = getattr(mod, factory_name, None)
+            if factory_fn is None:
+                return dedup_key, ""
+            try:
+                factory_src = inspect.getsource(factory_fn)
+            except (OSError, TypeError):
+                return dedup_key, ""
+
+            parts = [factory_src]
+            seen_helpers: set[str] = set()
+
+            def _safe_getsource(fn) -> str | None:
+                # Triton JITFunction wraps the original Python fn in .fn or __wrapped__.
+                # inspect.getsource on the JITFunction object itself would return the
+                # class source, not the kernel body — so unwrap first.
+                for candidate in (fn,
+                                   getattr(fn, "__wrapped__", None),
+                                   getattr(fn, "fn", None)):
+                    if candidate is None:
+                        continue
+                    try:
+                        return inspect.getsource(candidate)
+                    except (OSError, TypeError):
+                        pass
+                return None
+
+            def _collect(text: str, depth: int) -> None:
+                if depth <= 0:
+                    return
+                for name in set(_re.findall(r"\b(_[a-zA-Z0-9_]+)\b", text)):
+                    if name in seen_helpers:
+                        continue
+                    fn = getattr(mod, name, None)
+                    if fn is not None and callable(fn):
+                        seen_helpers.add(name)
+                        fn_src = _safe_getsource(fn)
+                        if fn_src:
+                            parts.append(fn_src)
+                            _collect(fn_src, depth - 1)
+
+            _collect(factory_src, depth=2)
+            return dedup_key, "\n\n".join(parts)
+
+        # Direct module-level function (e.g. elementwise.mul_tt).
+        dedup_key = f"{module_name}.{qualname}"
+        try:
+            return dedup_key, inspect.getsource(kernel)
+        except (OSError, TypeError):
+            return dedup_key, ""
+
+    # Dispatch.py closure or unknown: return closure source as-is.
+    dedup_key = f"dispatch.{qualname}"
+    try:
+        return dedup_key, inspect.getsource(kernel)
+    except (OSError, TypeError):
+        return dedup_key, ""
+
+
+def generate_dispatch_context(graph_path: Path) -> str:
     """Build a lowering_context.md from dispatch.py for each call_function node.
 
-    Safe to call without CUDA: make_kernel creates closures but does not execute
+    Shows the full Triton implementation for each node — not truncated, not just
+    the dispatch closure.  For factory-returned kernels (e.g. reduction ops) this
+    includes the factory function plus all @triton.jit helper kernels it calls.
+    Repeated uses of the same underlying implementation are deduplicated with a
+    back-reference so the context stays readable.
+
+    Safe to call without CUDA: make_kernel creates closures but never executes
     Triton kernels, so this works on any machine that has the package installed.
     The resulting file is consumed by Pipeline E as grounding for the LLM.
     """
@@ -85,7 +177,6 @@ def generate_dispatch_context(graph_path: Path, max_source_chars: int = 500) -> 
 
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     registry = make_registry(graph)
-    placeholders = [n for n in graph["nodes"] if n["op"] == "placeholder"]
     call_nodes = [n for n in graph["nodes"] if n["op"] == "call_function"]
 
     lines = [
@@ -102,6 +193,9 @@ def generate_dispatch_context(graph_path: Path, max_source_chars: int = 500) -> 
         "## Per-Node Kernel Mapping",
         "",
     ]
+
+    # dedup_key -> node name where the source was first shown
+    seen_sources: dict[str, str] = {}
 
     for node in call_nodes:
         name = node["name"]
@@ -130,13 +224,16 @@ def generate_dispatch_context(graph_path: Path, max_source_chars: int = 500) -> 
         )
 
         if kernel is not None:
-            try:
-                src = inspect.getsource(kernel).strip()
-                if len(src) > max_source_chars:
-                    src = src[:max_source_chars] + "\n# ... truncated"
-                lines += ["```python", src, "```"]
-            except (OSError, TypeError):
-                pass
+            dedup_key, src = _get_triton_source(kernel)
+            if src:
+                if dedup_key not in seen_sources:
+                    seen_sources[dedup_key] = name
+                    lines += ["```python", src.strip(), "```"]
+                else:
+                    lines.append(
+                        f"_(same Triton implementation as `{seen_sources[dedup_key]}`"
+                        f" — see source above)_"
+                    )
 
         lines.append("")
 
@@ -158,7 +255,6 @@ def _run_dtype(
     if not torch.cuda.is_available():
         return {"passed": False, "dtype": dtype_name, "error": "CUDA not available"}
 
-    import importlib
     from atenir.compose import run_graph
     from atenir.primitive_triton.dispatch import make_registry
 
