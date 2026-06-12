@@ -99,7 +99,9 @@ def make_kernel(node: dict) -> Callable:  # noqa: C901 (complex but intentionall
 
         return _mul_s
 
-    if "aten.add" in target:
+    # "aten.add." (trailing dot) so this does NOT also match "aten.addmm.default";
+    # addmm is handled in the matmul group below.
+    if "aten.add." in target:
         if n_tensors >= 2:
             alpha = float(scalar_args[0]) if scalar_args else 1.0
             if alpha == 1.0:
