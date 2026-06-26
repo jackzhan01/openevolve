@@ -4,9 +4,9 @@ log_level: "INFO"
 max_tasks_per_child: 1
 
 llm:
-  primary_model: "gpt-4o-mini"
+  primary_model: "gpt-5.5"
   primary_model_weight: 0.8
-  secondary_model: "gpt-4o"
+  secondary_model: "gpt-5.5"
   secondary_model_weight: 0.2
   api_base: "https://api.openai.com/v1"
   api_key: "${OPENAI_API_KEY}"
@@ -59,6 +59,15 @@ prompt:
     Do not call PyTorch autograd or high-level PyTorch LayerNorm in the generated
     math.  Prefer Triton kernels for core forward/backward work.
 
+    Hardware feedback:
+    When a candidate becomes the new best, the evaluator profiles it with
+    Nsight Compute. If any hardware problems are detected, a "hardware_warnings"
+    artifact appears listing the issues. Each warning names a specific bottleneck
+    and the general fix -- take it seriously and address it in your next mutation.
+    No artifact means the hardware profile is clean.
+    Penalized patterns also reduce the combined_score directly, so fixing them
+    improves both the score and the hardware health of the kernel.
+
 database:
   population_size: 30
   archive_size: 20
@@ -68,7 +77,7 @@ database:
   similarity_threshold: 0.99
 
 evaluator:
-  timeout: 300
+  timeout: 420
   parallel_evaluations: 1
   cascade_evaluation: false
 
