@@ -6,11 +6,12 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from pipeline.shared.llm_client import (
-    generate_with_openai_compatible_api,
+    generate_with_openai_compatible_api_metadata,
 )
 from pipeline.fusion_agent.graph_summary import summarize_graph_file
 from pipeline.fusion_agent.prompts import (
@@ -24,7 +25,10 @@ from pipeline.fusion_agent.prompts import (
 @dataclass(frozen=True)
 class FusionConfig:
     forward: str
+    example_input: str
     public_api: str
+    api_signature: str
+    return_contract: str
     op: str
     mode: str
     output_dir: Path
@@ -41,6 +45,7 @@ class FusionConfig:
     fp16_atol: float
     fp16_rtol: float
     scalar_args: tuple[str, ...]
+    backward_input_indices: tuple[int, ...] | None
     python: str
     lowering_context: str | None = None
     dry_run: bool = False
@@ -62,7 +67,7 @@ def _extract_graph(config: FusionConfig) -> Path:
         "--fn",
         config.forward,
         "--example-input",
-        "[(8,64) f32, (64) f32, (64) f32]",
+        config.example_input,
         "--out",
         str(graph_path),
     ]
@@ -99,6 +104,8 @@ def _verify_program_for_dtype(config: FusionConfig, program_path: Path, dtype: s
         str(program_path),
         "--backward-fn",
         config.public_api,
+        "--op",
+        config.op,
         "--mode",
         config.mode,
         "--atol",
@@ -110,6 +117,9 @@ def _verify_program_for_dtype(config: FusionConfig, program_path: Path, dtype: s
     ]
     for scalar in config.scalar_args:
         cmd.extend(["--scalar", scalar])
+    if config.backward_input_indices is not None:
+        indices = ",".join(str(index) for index in config.backward_input_indices)
+        cmd.extend(["--backward-input-indices", indices])
     completed = subprocess.run(
         cmd,
         cwd=str(Path(__file__).resolve().parents[2]),
@@ -148,8 +158,55 @@ def _verify_program(config: FusionConfig, program_path: Path) -> dict:
     }
 
 
+def _merge_usage(total: dict[str, int], metadata: dict) -> None:
+    usage = metadata.get("usage") or {}
+    for key, value in usage.items():
+        if isinstance(value, int):
+            total[key] = total.get(key, 0) + value
+
+
+def _write_cost_summary(output_dir: Path, calls: list[dict], attempts: int, passed: bool) -> None:
+    usage_totals: dict[str, int] = {}
+    for call in calls:
+        _merge_usage(usage_totals, call)
+    summary = {
+        "agent": "fusion_agent",
+        "passed": passed,
+        "attempts": attempts,
+        "llm_call_count": len(calls),
+        "prompt_chars_total": sum(int(call.get("prompt_chars", 0)) for call in calls),
+        "response_chars_total": sum(int(call.get("response_chars", 0)) for call in calls),
+        "usage_totals": usage_totals,
+        "calls": calls,
+    }
+    (output_dir / "cost_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _call_llm(*, config: FusionConfig, prompt: str, call_name: str, calls: list[dict]) -> str:
+    start = time.time()
+    content, metadata = generate_with_openai_compatible_api_metadata(
+        prompt=prompt,
+        system_message=SYSTEM_MESSAGE,
+        model=config.model,
+        api_base=config.api_base,
+        api_key=config.api_key,
+        max_tokens=config.max_tokens,
+        temperature=config.temperature,
+        timeout=config.timeout,
+    )
+    metadata = dict(metadata)
+    metadata["call_name"] = call_name
+    metadata["elapsed_sec"] = time.time() - start
+    calls.append(metadata)
+    return content
+
+
 def synthesize_fusion(config: FusionConfig) -> int:
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    calls: list[dict] = []
     print("Extract: AtenIR backward graph")
     graph_path = _extract_graph(config)
     graph_summary = summarize_graph_file(graph_path)
@@ -163,6 +220,8 @@ def synthesize_fusion(config: FusionConfig) -> int:
     plan_prompt = render_fusion_plan_prompt(
         forward=config.forward,
         public_api=config.public_api,
+        api_signature=config.api_signature,
+        return_contract=config.return_contract,
         graph_summary=graph_summary,
         lowering_context=lowering_context,
     )
@@ -171,6 +230,8 @@ def synthesize_fusion(config: FusionConfig) -> int:
     if config.dry_run:
         code_prompt = render_codegen_prompt(
             public_api=config.public_api,
+            api_signature=config.api_signature,
+            return_contract=config.return_contract,
             graph_summary=graph_summary,
             fusion_plan="{FUSION_PLAN_FROM_LLM}",
             lowering_context=lowering_context,
@@ -178,26 +239,25 @@ def synthesize_fusion(config: FusionConfig) -> int:
         dry_dir = config.output_dir / "attempt_001"
         dry_dir.mkdir(parents=True, exist_ok=True)
         (dry_dir / "codegen_prompt.md").write_text(code_prompt, encoding="utf-8")
+        _write_cost_summary(config.output_dir, calls, attempts=0, passed=False)
         print(f"dry-run wrote {config.output_dir / 'graph_summary.md'}")
         print(f"dry-run wrote {config.output_dir / 'fusion_plan_prompt.md'}")
         print(f"dry-run wrote {dry_dir / 'codegen_prompt.md'}")
         return 0
 
     print("Fusion: plan synthesis")
-    fusion_plan = generate_with_openai_compatible_api(
+    fusion_plan = _call_llm(
+        config=config,
         prompt=plan_prompt,
-        system_message=SYSTEM_MESSAGE,
-        model=config.model,
-        api_base=config.api_base,
-        api_key=config.api_key,
-        max_tokens=config.max_tokens,
-        temperature=config.temperature,
-        timeout=config.timeout,
+        call_name="plan",
+        calls=calls,
     )
     (config.output_dir / "fusion_plan.md").write_text(fusion_plan, encoding="utf-8")
 
     prompt = render_codegen_prompt(
         public_api=config.public_api,
+        api_signature=config.api_signature,
+        return_contract=config.return_contract,
         graph_summary=graph_summary,
         fusion_plan=fusion_plan,
         lowering_context=lowering_context,
@@ -209,15 +269,11 @@ def synthesize_fusion(config: FusionConfig) -> int:
         attempt_dir.mkdir(parents=True, exist_ok=True)
         (attempt_dir / "codegen_prompt.md").write_text(prompt, encoding="utf-8")
         print(f"Fusion: codegen attempt {attempt}/{config.max_attempts}")
-        response = generate_with_openai_compatible_api(
+        response = _call_llm(
+            config=config,
             prompt=prompt,
-            system_message=SYSTEM_MESSAGE,
-            model=config.model,
-            api_base=config.api_base,
-            api_key=config.api_key,
-            max_tokens=config.max_tokens,
-            temperature=config.temperature,
-            timeout=config.timeout,
+            call_name=f"codegen_attempt_{attempt}",
+            calls=calls,
         )
         code = _strip_code_fence(response)
         program_path = attempt_dir / "program.py"
@@ -238,12 +294,15 @@ def synthesize_fusion(config: FusionConfig) -> int:
                 json.dumps(report, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
+            _write_cost_summary(config.output_dir, calls, attempts=attempt, passed=True)
             print(f"Fusion synthesis passed. Best program: {best_path}")
             return 0
 
         verifier_report = json.dumps(report, indent=2, sort_keys=True)
         repair_prompt = render_repair_prompt(
             public_api=config.public_api,
+            api_signature=config.api_signature,
+            return_contract=config.return_contract,
             graph_summary=graph_summary,
             fusion_plan=fusion_plan,
             previous_code=code or previous_code,
@@ -253,7 +312,9 @@ def synthesize_fusion(config: FusionConfig) -> int:
         (attempt_dir / "repair_prompt.md").write_text(repair_prompt, encoding="utf-8")
         prompt = repair_prompt
         previous_code = code
+        _write_cost_summary(config.output_dir, calls, attempts=attempt, passed=False)
         print(f"attempt {attempt} failed; wrote repair prompt")
 
+    _write_cost_summary(config.output_dir, calls, attempts=config.max_attempts, passed=False)
     print(f"Fusion synthesis failed after {config.max_attempts} attempts")
     return 1

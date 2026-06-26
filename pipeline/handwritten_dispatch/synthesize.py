@@ -48,6 +48,7 @@ class HandwrittenDispatchConfig:
     fp16_atol: float
     fp16_rtol: float
     python: str
+    emit_autograd_pair_seed: bool = False
 
 
 # ── graph extraction ──────────────────────────────────────────────────────────
@@ -348,13 +349,21 @@ def synthesize_handwritten_dispatch(config: HandwrittenDispatchConfig) -> int:
 
     print("[D] Generate dispatch program (dispatch_program.py — the optimized seed)")
     try:
-        from pipeline.handwritten_dispatch.program_codegen import generate_dispatch_program
+        from pipeline.handwritten_dispatch.program_codegen import (
+            generate_autograd_pair_program,
+            generate_dispatch_program,
+        )
 
         graph = json.loads(graph_path.read_text(encoding="utf-8"))
         program = generate_dispatch_program(graph)
         program_path = config.output_dir / "dispatch_program.py"
         program_path.write_text(program, encoding="utf-8")
         print(f"  → {program_path} ({len(program)} chars)")
+        if config.emit_autograd_pair_seed:
+            pair_program = generate_autograd_pair_program(graph, forward=config.forward)
+            pair_path = config.output_dir / "initial_program_autograd_pair.py"
+            pair_path.write_text(pair_program, encoding="utf-8")
+            print(f"  → {pair_path} ({len(pair_program)} chars)")
     except Exception as exc:
         print(f"  Warning: dispatch program generation failed: {exc}")
 

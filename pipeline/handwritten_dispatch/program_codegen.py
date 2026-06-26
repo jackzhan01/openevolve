@@ -425,3 +425,57 @@ import triton.language.extra.cuda.libdevice as libdevice
         *call_lines,
     ]
     return "\n".join(lines) + "\n"
+
+
+def generate_autograd_pair_program(graph: dict, *, forward: str) -> str:
+    """Build an autograd-pair seed around the dispatch-free backward program.
+
+    The backward uses the generated `run_graph_program` call sequence. The
+    initial saved-tensor policy is deliberately conservative: save only original
+    inputs and let OpenEvolve modify the EVOLVE-BLOCK later.
+    """
+    source = generate_dispatch_program(graph)
+    wrapper = f'''
+
+_FORWARD_SPEC = {forward!r}
+
+
+def _load_forward_callable():
+    module_name, fn_name = (
+        _FORWARD_SPEC.split(":", 1)
+        if ":" in _FORWARD_SPEC
+        else _FORWARD_SPEC.rsplit(".", 1)
+    )
+    module = __import__(module_name, fromlist=[fn_name])
+    return getattr(module, fn_name)
+
+
+def _forward_with_saved_impl(x, weight, bias, eps=1e-5):
+    # Conservative seed: only save original forward inputs. OpenEvolve may
+    # replace this with saved mean/rstd/xhat or other intermediates.
+    y = _load_forward_callable()(x, weight, bias, eps)
+    return y, (x.contiguous(), weight.contiguous(), bias.contiguous())
+
+
+def _backward_from_saved_impl(dy, saved_tensors, eps=1e-5):
+    _ = eps
+    x, weight, bias = saved_tensors[:3]
+    return run_graph_program(
+        dy.contiguous(),
+        x.contiguous(),
+        weight.contiguous(),
+        bias.contiguous(),
+    )
+
+
+def layernorm_forward_with_saved(x, weight, bias, eps=1e-5):
+    return _forward_with_saved_impl(x, weight, bias, eps)
+
+
+def layernorm_backward_from_saved(dy, saved_tensors, eps=1e-5):
+    return _backward_from_saved_impl(dy, saved_tensors, eps)
+'''
+    marker = "# EVOLVE-BLOCK-END"
+    if marker not in source:
+        return source + wrapper
+    return source.replace(marker, wrapper.rstrip() + "\n" + marker, 1)

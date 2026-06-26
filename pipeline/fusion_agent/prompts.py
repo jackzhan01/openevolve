@@ -42,6 +42,8 @@ def render_fusion_plan_prompt(
     *,
     forward: str,
     public_api: str,
+    api_signature: str,
+    return_contract: str,
     graph_summary: str,
     lowering_context: str = "",
 ) -> str:
@@ -71,8 +73,8 @@ Forward reference:
 Public API to generate:
 
 ```python
-def {public_api}(dy, x, weight, bias, eps=1e-5):
-    return dx, dweight, dbias
+{api_signature}
+    {return_contract}
 ```
 
 The AtenIR backward graph below is already verified by primitive composition.
@@ -96,6 +98,8 @@ Return Markdown with:
 def render_codegen_prompt(
     *,
     public_api: str,
+    api_signature: str,
+    return_contract: str,
     graph_summary: str,
     fusion_plan: str,
     lowering_context: str = "",
@@ -120,8 +124,8 @@ handling, while still writing fused Triton kernels for the public API.
 Generate a complete Python module implementing:
 
 ```python
-def {public_api}(dy, x, weight, bias, eps=1e-5):
-    return dx, dweight, dbias
+{api_signature}
+    {return_contract}
 ```
 
 Requirements:
@@ -130,9 +134,12 @@ Requirements:
 - Preserve the semantics of the AtenIR graph.
 - Use fp32 accumulation for reductions.
 - Support both float32 and float16 input tensors. Do not reject float16 tensors.
-- Return `dx` with `x` dtype, `dweight` with `weight` dtype, and `dbias` with `bias` dtype.
-- Use output tensors allocated with `torch.empty_like(x)`, `torch.empty_like(weight)`,
-  and `torch.empty_like(bias)` so stores cast back to the expected dtype.
+- Preserve the output order and shapes specified by the public API contract.
+- Return gradient tensors with the dtype of the corresponding primal tensor when
+  there is a direct primal; for scalar-only gradients, use the dtype implied by
+  the incoming gradient tensor.
+- Allocate outputs with `torch.empty_like` / `torch.zeros_like` where possible so
+  stores cast back to the expected dtype.
 - Do not check that inputs are exactly `torch.float32`; only require CUDA floating tensors.
 - Include an `EVOLVE-BLOCK` around generated Triton kernels and launch helpers.
 - Do not call PyTorch autograd or high-level PyTorch reference operators in the
@@ -157,6 +164,8 @@ AtenIR graph summary:
 def render_repair_prompt(
     *,
     public_api: str,
+    api_signature: str,
+    return_contract: str,
     graph_summary: str,
     fusion_plan: str,
     previous_code: str,
@@ -181,8 +190,8 @@ The generated fused backward program failed correctness.
 Public API:
 
 ```python
-def {public_api}(dy, x, weight, bias, eps=1e-5):
-    return dx, dweight, dbias
+{api_signature}
+    {return_contract}
 ```
 
 Verifier report:

@@ -78,6 +78,21 @@ def _requires_default_temperature(model: str) -> bool:
     return model_l.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
+def _usage_to_dict(usage) -> dict:
+    if usage is None:
+        return {}
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    if isinstance(usage, dict):
+        return dict(usage)
+    result = {}
+    for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = getattr(usage, name, None)
+        if value is not None:
+            result[name] = value
+    return result
+
+
 def generate_with_openai_compatible_api(
     *,
     prompt: str,
@@ -91,6 +106,34 @@ def generate_with_openai_compatible_api(
     max_retries: int = 8,
     initial_delay: float = 2.0,
 ) -> str:
+    content, _metadata = generate_with_openai_compatible_api_metadata(
+        prompt=prompt,
+        system_message=system_message,
+        model=model,
+        api_base=api_base,
+        api_key=api_key,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout=timeout,
+        max_retries=max_retries,
+        initial_delay=initial_delay,
+    )
+    return content
+
+
+def generate_with_openai_compatible_api_metadata(
+    *,
+    prompt: str,
+    system_message: str,
+    model: str,
+    api_base: str,
+    api_key: str | None,
+    max_tokens: int,
+    temperature: float | None,
+    timeout: int,
+    max_retries: int = 8,
+    initial_delay: float = 2.0,
+) -> tuple[str, dict]:
     resolved_api_key = api_key or os.environ.get("OPENAI_API_KEY") or "none"
     client = openai.OpenAI(
         api_key=resolved_api_key,
@@ -116,7 +159,16 @@ def generate_with_openai_compatible_api(
     for attempt in range(max_retries + 1):
         try:
             response = client.chat.completions.create(**params)
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            metadata = {
+                "model": model,
+                "api_base": api_base,
+                "prompt_chars": len(prompt),
+                "system_message_chars": len(system_message),
+                "response_chars": len(content or ""),
+                "usage": _usage_to_dict(getattr(response, "usage", None)),
+            }
+            return content, metadata
 
         except openai.RateLimitError as exc:
             if attempt == max_retries:

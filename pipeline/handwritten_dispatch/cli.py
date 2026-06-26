@@ -52,6 +52,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--fp16-atol", type=float, default=5e-2)
     parser.add_argument("--fp16-rtol", type=float, default=5e-2)
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--emit-autograd-pair-seed",
+        action="store_true",
+        help="Also write initial_program_autograd_pair.py wrapping dispatch_program.py with saved_tensors API",
+    )
     return parser.parse_args(argv)
 
 
@@ -68,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
             fp16_atol=args.fp16_atol,
             fp16_rtol=args.fp16_rtol,
             python=args.python,
+            emit_autograd_pair_seed=args.emit_autograd_pair_seed,
         )
     )
 
