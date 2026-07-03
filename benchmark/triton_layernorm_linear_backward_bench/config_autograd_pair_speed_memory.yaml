@@ -1,0 +1,68 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-4o-mini"
+  primary_model_weight: 0.8
+  secondary_model: "gpt-4o"
+  secondary_model_weight: 0.2
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 180
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an autograd-pair kernel.
+
+    Task:
+    Improve the code inside the EVOLVE-BLOCK. The public API is a flexible
+    forward/backward pair:
+
+        def layernorm_linear_forward_with_saved(x, weight, bias, linear_weight, eps=1e-5):
+            return out, saved_tensors
+
+        def layernorm_linear_backward_from_saved(dout, saved_tensors, eps=1e-5):
+            return dx, dlinear_weight, dweight, dbias
+
+    ``weight``/``bias`` are the LayerNorm affine params (gamma, beta) of length K;
+    ``linear_weight`` is the Linear matrix B [K, N]. You may modify which tensors
+    the forward saves, as long as backward consumes the same saved_tensors
+    contract and correctness is preserved.
+
+    The evaluator is memory-aware:
+    - It measures backward_from_saved latency.
+    - It measures forward+backward full-step latency.
+    - It reports saved_memory_ratio = saved_bytes / input_bytes.
+    - The combined score uses a weighted speedup with a small penalty for saved
+      tensor memory.
+
+    Saved tensor policy:
+    - Prefer compact per-row statistics (mean, rstd) over full activation-sized
+      tensors when the backward can cheaply reconstruct x_hat / y_hat. Saving the
+      [M, K] normalized activation costs the same memory as x itself.
+    - linear_weight and gamma are needed by the backward; bias (beta) is not.
+    - Saved tensors are part of the optimization tradeoff, not free inputs.
+
+    Correctness is a hard requirement. Support the benchmark's float32 and
+    float16 CUDA cases, preserve output dtypes, and accumulate matmuls and norm
+    reductions in fp32. Do not call PyTorch autograd in generated math.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

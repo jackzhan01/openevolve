@@ -1,0 +1,73 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-4o-mini"
+  primary_model_weight: 0.8
+  secondary_model: "gpt-4o"
+  secondary_model_weight: 0.2
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 180
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an RMSNorm autograd pair.
+
+    Task:
+    Improve the code inside the EVOLVE-BLOCK.  The public API is intentionally a
+    forward/backward pair with a flexible saved-tensor contract:
+
+        def rmsnorm_forward_with_saved(x, weight, eps=1e-5):
+            return y, saved_tensors
+
+        def rmsnorm_backward_from_saved(dy, saved_tensors, eps=1e-5):
+            return dx, dweight
+
+    The seed may save only the original inputs.  You may modify the EVOLVE-BLOCK
+    so forward saves additional tensors, removes tensors, or changes their order,
+    as long as backward consumes the same saved_tensors contract and correctness
+    is preserved.
+
+    Forward semantics:
+        rrms = rsqrt(mean(x^2, axis=-1, keepdim=True) + eps)
+        y = x * rrms * weight
+
+    Backward semantics:
+        g = dy * weight
+        dx = (g - xhat * mean(g * xhat, axis=-1, keepdim=True)) * rrms
+        dweight = sum(dy * xhat, dim=0)            # xhat = x * rrms
+
+    Correctness is a hard requirement.  The evaluator verifies the autograd pair
+    against PyTorch autograd and reports saved tensor memory.
+
+    Optimization target:
+    - Improve backward_from_saved latency and forward+backward end-to-end latency.
+    - You may trade extra saved tensor memory for faster backward if beneficial.
+    - Keep support for contiguous 2D CUDA tensors x/dy shaped [rows, hidden].
+    - Keep support for contiguous 1D CUDA tensors weight shaped [hidden].
+    - Support float32 and float16 benchmark cases.
+    - Use fp32 accumulation for reductions.
+
+    Do not call PyTorch autograd or high-level PyTorch RMSNorm in the generated
+    math.  Prefer Triton kernels for core forward/backward work.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

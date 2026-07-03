@@ -1,0 +1,66 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-4o-mini"
+  primary_model_weight: 0.8
+  secondary_model: "gpt-4o"
+  secondary_model_weight: 0.2
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 180
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an autograd-pair kernel.
+
+    Task:
+    Improve the code inside the EVOLVE-BLOCK. The public API is a flexible
+    forward/backward pair:
+
+        def linear_forward_with_saved(x, weight, bias):
+            return y, saved_tensors
+
+        def linear_backward_from_saved(dy, saved_tensors):
+            return dx, dweight, dbias
+
+    You may modify which tensors the forward saves, as long as backward consumes
+    the same saved_tensors contract and correctness is preserved.
+
+    The evaluator is memory-aware:
+    - It measures backward_from_saved latency.
+    - It measures forward+backward full-step latency.
+    - It reports saved_memory_ratio = saved_bytes / input_bytes.
+    - The combined score uses a weighted speedup with a small penalty for saved
+      tensor memory.
+
+    Saved tensor policy:
+    - The Linear backward needs x (for dweight) and weight (for dx); dbias only
+      needs dy. Saving x and weight is usually unavoidable.
+    - Do not save the forward output y or the bias (dbias = sum(dy) is independent
+      of the bias value). Saved tensors are part of the optimization tradeoff,
+      not free inputs.
+
+    Correctness is a hard requirement. Support the benchmark's float32 and
+    float16 CUDA cases, preserve output dtypes, and accumulate matmuls in fp32.
+    Do not call PyTorch autograd in generated math.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

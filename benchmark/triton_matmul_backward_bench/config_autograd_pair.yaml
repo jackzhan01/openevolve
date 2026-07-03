@@ -1,0 +1,71 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-4o-mini"
+  primary_model_weight: 0.8
+  secondary_model: "gpt-4o"
+  secondary_model_weight: 0.2
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 180
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing a matmul (GEMM) autograd
+    pair.
+
+    Task:
+    Improve the code inside the EVOLVE-BLOCK.  The public API is intentionally a
+    forward/backward pair with a flexible saved-tensor contract:
+
+        def matmul_forward_with_saved(a, b):
+            return c, saved_tensors
+
+        def matmul_backward_from_saved(dc, saved_tensors):
+            return da, db
+
+    The seed may save only the original inputs.  You may modify the EVOLVE-BLOCK
+    so forward saves additional tensors, removes tensors, or changes their order,
+    as long as backward consumes the same saved_tensors contract and correctness
+    is preserved.  Note there is no eps for plain GEMM.
+
+    Forward semantics:
+        c = a @ b            # a is [M, K], b is [K, N], c is [M, N]
+
+    Backward semantics:
+        da = dc @ b.T        # [M, K]
+        db = a.T @ dc        # [K, N]
+
+    Correctness is a hard requirement.  The evaluator verifies the autograd pair
+    against PyTorch autograd and reports saved tensor memory.
+
+    Optimization target:
+    - Improve backward_from_saved latency and forward+backward end-to-end latency.
+    - These shapes are compute-bound; favour tensor-core tiled matmul (tl.dot)
+      with good block sizes, K-splitting, and accumulation in fp32.
+    - Keep support for contiguous 2D CUDA tensors, float32 and float16.
+    - da must match a's dtype, db must match b's dtype.
+
+    Do not call PyTorch autograd or torch.matmul/@ in the generated math.  Prefer
+    Triton kernels for the core matmuls.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

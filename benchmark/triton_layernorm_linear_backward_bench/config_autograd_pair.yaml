@@ -1,0 +1,82 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-4o-mini"
+  primary_model_weight: 0.8
+  secondary_model: "gpt-4o"
+  secondary_model_weight: 0.2
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 180
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing a fused LayerNorm -> Linear
+    autograd pair.
+
+    Task:
+    Improve the code inside the EVOLVE-BLOCK.  The public API is intentionally a
+    forward/backward pair with a flexible saved-tensor contract:
+
+        def layernorm_linear_forward_with_saved(x, weight, bias, linear_weight, eps=1e-5):
+            return out, saved_tensors
+
+        def layernorm_linear_backward_from_saved(dout, saved_tensors, eps=1e-5):
+            return dx, dlinear_weight, dweight, dbias
+
+    Here ``weight`` and ``bias`` are the LayerNorm affine params (gamma, beta) of
+    length K, and ``linear_weight`` is the Linear matrix B of shape [K, N].
+
+    The seed may save only the original inputs.  You may modify the EVOLVE-BLOCK
+    so forward saves additional tensors (e.g. per-row mean/rstd or the normalized
+    activation x_hat), removes tensors, or changes their order, as long as
+    backward consumes the same saved_tensors contract and correctness is
+    preserved.
+
+    Forward semantics:
+        x_hat = (x - mean(x, -1)) * rstd          # rstd = rsqrt(var(x, -1) + eps)
+        y_hat = x_hat * gamma + beta              # gamma=weight, beta=bias, [M, K]
+        out = y_hat @ linear_weight               # [M, N]
+
+    Backward semantics (returned in this exact order):
+        dy_hat = dout @ linear_weight.T           # [M, K]
+        dlinear_weight = y_hat.T @ dout           # [K, N]
+        dgamma (dweight) = sum(dy_hat * x_hat, dim=0)   # [K]
+        dbeta  (dbias)   = sum(dy_hat, dim=0)           # [K]
+        wdy = dy_hat * gamma
+        dx = (wdy - x_hat * mean(x_hat * wdy, -1) - mean(wdy, -1)) * rstd  # [M, K]
+
+    Correctness is a hard requirement.  The evaluator verifies the autograd pair
+    against PyTorch autograd and reports saved tensor memory.
+
+    Optimization target:
+    - Improve backward_from_saved latency and forward+backward end-to-end latency.
+    - Use tensor-core tiled matmul (tl.dot) with fp32 accumulation for the GEMMs,
+      and fp32 accumulation for the LayerNorm row reductions.
+    - Keep support for contiguous CUDA tensors x [M, K], gamma/beta [K],
+      linear_weight [K, N]; support float32 and float16.
+    - Output dtypes: dx ~ x, dlinear_weight ~ linear_weight, dweight/dbias ~ gamma.
+
+    Do not call PyTorch autograd, F.layer_norm, F.linear, torch.matmul, or @ in
+    the generated math.  Prefer Triton kernels for the core work.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000
