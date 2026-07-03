@@ -67,6 +67,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "seed. When omitted, the LayerNorm contract is used (back-compatible)."
         ),
     )
+    parser.add_argument(
+        "--static-shapes",
+        action="store_true",
+        help=(
+            "Extract with static shapes (legacy behavior). By default the AtenIR "
+            "graph is extracted with symbolic shapes so the generated program is "
+            "correct at any input shape."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -90,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
             python=args.python,
             emit_autograd_pair_seed=args.emit_autograd_pair_seed,
             op_spec=op_spec,
+            dynamic_shapes=not args.static_shapes,
         )
     )
 

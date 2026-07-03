@@ -87,6 +87,63 @@ def make_kernel(node: dict) -> Callable:  # noqa: C901 (complex but intentionall
     keepdim = bool(node.get("keepdim") or False)
     output_shape = node.get("output_shape")
 
+    # ── Category 0: symbolic-shape args (atenir.extract --dynamic) ────────────
+    # Symbolic tracing replaces shape-derived literals with int-valued nodes:
+    #   * aten.sym_size.int nodes produce runtime ints (t.shape[dim]);
+    #   * "sym_node" args stand where a static trace baked a scalar;
+    #   * "shape_list" args carry node refs inside shape lists (expand/view).
+    # Kernels here take those values at call time instead of baking them, so the
+    # same graph is correct at any input shape.
+    n_sym_nodes = sum(1 for e in ao if e.get("kind") == "sym_node")
+    has_shape_list = any(e.get("kind") == "shape_list" for e in ao)
+
+    if "aten.sym_size" in target:
+        dim = int(scalar_args[0]) if scalar_args else 0
+
+        def _sym_size(a):
+            return int(a.shape[dim])
+
+        return _sym_size
+
+    if has_shape_list and "aten.expand" in target:
+
+        def _expand_rt(a, shape):
+            return a.expand(tuple(int(s) for s in shape)).contiguous()
+
+        return _expand_rt
+
+    if has_shape_list and (
+        "aten.view" in target or "aten._unsafe_view" in target or "aten.reshape" in target
+    ):
+
+        def _view_rt(a, shape):
+            return a.reshape(tuple(int(s) for s in shape)).contiguous()
+
+        return _view_rt
+
+    if n_sym_nodes and n_tensors == 1 and ao and ao[0].get("kind") == "node":
+        # Pointwise op whose scalar operand is a symbolic size (runtime int).
+        if "aten.div" in target:
+
+            def _div_sym(a, s):
+                return elementwise.div_scalar(a, float(s))
+
+            return _div_sym
+        if "aten.mul" in target:
+
+            def _mul_sym(a, s):
+                return elementwise.mul_scalar(a, float(s))
+
+            return _mul_sym
+
+    if n_sym_nodes or has_shape_list:
+        # Fail loudly: falling through to the static branches would bake a stale
+        # default (e.g. s=1.0) and silently compute wrong gradients.
+        raise ValueError(
+            f"symbolic arg on unsupported target {target!r} "
+            f"(node {node.get('name')!r}); extend make_kernel Category 0"
+        )
+
     # ── Category 2: existing pointwise ops ────────────────────────────────────
 
     if "aten.mul" in target:

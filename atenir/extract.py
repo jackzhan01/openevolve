@@ -186,12 +186,32 @@ def _import_callable(spec: str):
 # ── Serialization (mirrors layernorm_bwd_graph.json schema) ──────────────────
 
 
+def _dim_to_int(d) -> int:
+    """Concrete value for a dim that may be a SymInt (symbolic trace).
+
+    SymInts from make_fx(tracing_mode="symbolic") carry the example input's
+    concrete size as a hint; serializing the hint keeps the JSON schema (and
+    every existing consumer) unchanged while the symbolic structure travels in
+    args_ordered (sym_node / shape_list entries) and sym_size nodes.
+    """
+    if isinstance(d, torch.SymInt):
+        return int(d.node.hint)
+    return int(d)
+
+
 def _node_meta(gm: fx.GraphModule):
     meta = {}
     for n in gm.graph.nodes:
         v = n.meta.get("val")
         if isinstance(v, torch.Tensor):
-            meta[n.name] = {"shape": list(v.shape), "dtype": str(v.dtype)}
+            shape = [_dim_to_int(d) for d in v.shape]
+            entry = {"shape": shape, "dtype": str(v.dtype)}
+            if any(isinstance(d, torch.SymInt) for d in v.shape):
+                entry["sym_shape"] = [str(d) for d in v.shape]
+            meta[n.name] = entry
+        elif isinstance(v, torch.SymInt):
+            # Int-valued node (aten.sym_size.int etc.) from a symbolic trace.
+            meta[n.name] = {"symint": str(v), "hint": _dim_to_int(v)}
     return meta
 
 
@@ -214,18 +234,32 @@ def _classify_args(node: fx.Node, meta):
     target = str(node.target)
     is_reduction = "sum" in target or "mean" in target
 
+    def _is_symint_node(a: fx.Node) -> bool:
+        return isinstance(a.meta.get("val"), torch.SymInt)
+
     def _process(a):
         nonlocal keepdim, reduction_dims
         if isinstance(a, fx.Node):
-            m = meta.get(a.name, {})
-            input_nodes.append({"name": a.name, "shape": m.get("shape"), "dtype": m.get("dtype")})
-            args_ordered.append({"kind": "node", "name": a.name})
+            if _is_symint_node(a):
+                # Int-valued node from a symbolic trace (e.g. aten.sym_size.int
+                # output standing where a static trace would bake a literal).
+                args_ordered.append({"kind": "sym_node", "name": a.name})
+            else:
+                m = meta.get(a.name, {})
+                input_nodes.append(
+                    {"name": a.name, "shape": m.get("shape"), "dtype": m.get("dtype")}
+                )
+                args_ordered.append({"kind": "node", "name": a.name})
 
         elif isinstance(a, bool):
             if is_reduction:
                 keepdim = a
             else:
                 args_ordered.append({"kind": "scalar", "value": a})
+
+        elif isinstance(a, torch.SymInt):
+            # Raw SymInt arg (no producing node in this graph); fall back to hint.
+            args_ordered.append({"kind": "scalar", "value": _dim_to_int(a)})
 
         elif isinstance(a, (int, float)):
             args_ordered.append({"kind": "scalar", "value": a})
@@ -237,7 +271,7 @@ def _classify_args(node: fx.Node, meta):
         elif isinstance(a, (list, tuple)):
             vals, ok = [], True
             for x in a:
-                if isinstance(x, fx.Node):
+                if isinstance(x, (fx.Node, torch.SymInt)):
                     ok = False
                     break
                 vals.append(x)
@@ -246,6 +280,21 @@ def _classify_args(node: fx.Node, meta):
                     reduction_dims = vals
                 else:
                     args_ordered.append({"kind": "scalar", "value": vals})
+            else:
+                # Shape-style list mixing node refs (symbolic dims) and literals,
+                # e.g. expand(t, [%sym_size_int_2, %sym_size_int_1]). A static
+                # trace never produces this; before symbolic mode these lists
+                # were silently dropped.
+                items = []
+                for x in a:
+                    if isinstance(x, fx.Node):
+                        kind = "sym_node" if _is_symint_node(x) else "node"
+                        items.append({"kind": kind, "name": x.name})
+                    elif isinstance(x, torch.SymInt):
+                        items.append({"kind": "scalar", "value": _dim_to_int(x)})
+                    else:
+                        items.append({"kind": "scalar", "value": x})
+                args_ordered.append({"kind": "shape_list", "items": items})
 
     for a in node.args:
         _process(a)
@@ -269,31 +318,37 @@ def _serialise(gm: fx.GraphModule) -> dict:
     for n in gm.graph.nodes:
         if n.op == "placeholder":
             m = meta.get(n.name, {})
-            nodes_json.append(
-                {
-                    "op": "placeholder",
-                    "name": n.name,
-                    "shape": m.get("shape"),
-                    "dtype": m.get("dtype"),
-                }
-            )
+            entry = {
+                "op": "placeholder",
+                "name": n.name,
+                "shape": m.get("shape"),
+                "dtype": m.get("dtype"),
+            }
+            if "sym_shape" in m:
+                entry["sym_shape"] = m["sym_shape"]
+            nodes_json.append(entry)
         elif n.op == "call_function":
             m = meta.get(n.name, {})
             input_nodes, red_dims, keepdim, args_ordered = _classify_args(n, meta)
             distinct_ops.add(str(n.target))
-            nodes_json.append(
-                {
-                    "op": "call_function",
-                    "name": n.name,
-                    "target": str(n.target),
-                    "output_shape": m.get("shape"),
-                    "output_dtype": m.get("dtype"),
-                    "input_nodes": input_nodes,
-                    "reduction_dims": red_dims,
-                    "keepdim": keepdim,
-                    "args_ordered": args_ordered,
-                }
-            )
+            entry = {
+                "op": "call_function",
+                "name": n.name,
+                "target": str(n.target),
+                "output_shape": m.get("shape"),
+                "output_dtype": m.get("dtype"),
+                "input_nodes": input_nodes,
+                "reduction_dims": red_dims,
+                "keepdim": keepdim,
+                "args_ordered": args_ordered,
+            }
+            if "sym_shape" in m:
+                entry["sym_output_shape"] = m["sym_shape"]
+            if "symint" in m:
+                # Int-valued node (aten.sym_size.int): record symbol + hint.
+                entry["output_symint"] = m["symint"]
+                entry["output_symint_hint"] = m["hint"]
+            nodes_json.append(entry)
         elif n.op == "output":
             nodes_json.append({"op": "output", "args": [arg_to_str(a) for a in n.args]})
 
@@ -327,7 +382,9 @@ def extract_named_op(op_name: str, parsed_args, device: str = "cpu") -> fx.Graph
     return make_fx(wrapped, decomposition_table=core_aten_decompositions())(*tensor_args)
 
 
-def extract_autograd(fn_spec: str, parsed_inputs, device: str = "cpu") -> fx.GraphModule:
+def extract_autograd(
+    fn_spec: str, parsed_inputs, device: str = "cpu", dynamic: bool = False
+) -> fx.GraphModule:
     forward_fn = _import_callable(fn_spec)
     fwd_in = [_materialise(x, device) for x in parsed_inputs]
     if not all(isinstance(t, torch.Tensor) for t in fwd_in):
@@ -350,6 +407,17 @@ def extract_autograd(fn_spec: str, parsed_inputs, device: str = "cpu") -> fx.Gra
             out = out[0]
         return torch.autograd.grad(out, ins, grad_outputs=grad_out)
 
+    # tracing_mode="symbolic" keeps input dims as SymInts, so shape-derived
+    # values appear as sym_size nodes / node refs in the graph instead of baked
+    # literals; downstream consumers can then emit shape-generic code. Static
+    # mode (default) is preserved for back-compat. Avoid size-1 dims in the
+    # example input under dynamic mode: symbolic tracing specializes on 0/1.
+    if dynamic:
+        return make_fx(
+            bwd,
+            decomposition_table=core_aten_decompositions(),
+            tracing_mode="symbolic",
+        )(grad_out, *fwd_in)
     return make_fx(bwd, decomposition_table=core_aten_decompositions())(grad_out, *fwd_in)
 
 
@@ -382,18 +450,29 @@ def main(argv=None) -> int:
     p.add_argument("--example-input", help="spec for --fn (CLI list of forward inputs)")
     p.add_argument("--out", required=True, help="output JSON path")
     p.add_argument("--device", default="cpu", help="device for trace tensors (default: cpu)")
+    p.add_argument(
+        "--dynamic",
+        action="store_true",
+        help=(
+            "trace with symbolic shapes (--fn mode only): shape-derived values "
+            "become sym_size nodes / node refs instead of baked literals, so "
+            "generated programs are correct at any input shape"
+        ),
+    )
     args = p.parse_args(argv)
 
     if args.op:
         if not args.example_args:
             p.error("--op requires --example-args")
+        if args.dynamic:
+            p.error("--dynamic is only supported with --fn (autograd mode)")
         parsed = _parse_spec(args.example_args)
         gm = extract_named_op(args.op, parsed, device=args.device)
     else:
         if not args.example_input:
             p.error("--fn requires --example-input")
         parsed = _parse_spec(args.example_input)
-        gm = extract_autograd(args.fn, parsed, device=args.device)
+        gm = extract_autograd(args.fn, parsed, device=args.device, dynamic=args.dynamic)
 
     graph = _serialise(gm)
     out_path = Path(args.out)

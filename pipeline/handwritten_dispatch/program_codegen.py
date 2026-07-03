@@ -374,12 +374,34 @@ def generate_dispatch_program(graph: dict) -> str:
         name = node["name"]
         target = node["target"]
         args_ordered = node.get("args_ordered")
+
+        # Symbolic-size nodes (extract --dynamic) become plain shape reads, so
+        # the emitted program derives every shape-dependent value at runtime.
+        if "aten.sym_size" in target and args_ordered:
+            src = next(e["name"] for e in args_ordered if e["kind"] == "node")
+            dim = next((e["value"] for e in args_ordered if e["kind"] == "scalar"), 0)
+            call_lines.append(
+                f"    {_pyname(name)} = int({_pyname(src)}.shape[{dim}])  # {name}: {target}"
+            )
+            continue
+
         if args_ordered is not None:
-            arg_names = [e["name"] for e in args_ordered if e["kind"] == "node"]
+            arg_exprs = []
+            for e in args_ordered:
+                kind = e["kind"]
+                if kind in ("node", "sym_node"):
+                    arg_exprs.append(_pyname(e["name"]))
+                elif kind == "shape_list":
+                    parts = [
+                        _pyname(it["name"]) if it["kind"] in ("node", "sym_node") else repr(it["value"])
+                        for it in e["items"]
+                    ]
+                    trailing = "," if len(parts) == 1 else ""
+                    arg_exprs.append(f"({', '.join(parts)}{trailing})")
         else:
-            arg_names = list(node.get("predecessor_ids") or [])
+            arg_exprs = [_pyname(a) for a in (node.get("predecessor_ids") or [])]
         kernel = make_kernel(node)
-        call_expr = builder.call_expr_for_node(node, kernel, [_pyname(a) for a in arg_names])
+        call_expr = builder.call_expr_for_node(node, kernel, arg_exprs)
         call_lines.append(f"    {_pyname(name)} = {call_expr}  # {name}: {target}")
 
     output_names = out_node["args"][0]

@@ -90,11 +90,28 @@ def run_graph(
 
         args_ordered = node.get("args_ordered")
         if args_ordered is not None:
-            # Only pass tensor inputs; scalars are baked into kernels at dispatch
-            # time (make_kernel reads node["scalar_args"]).  Passing traced
+            # Pass tensor inputs plus symbolic-shape values; literal scalars are
+            # baked into kernels at dispatch time (make_kernel).  Passing traced
             # scalar kwargs (device=cpu, dtype=float32, …) at GPU runtime would
             # silently override device/dtype to CPU trace-time values.
-            args = [env[entry["name"]] for entry in args_ordered if entry["kind"] == "node"]
+            #   node       -- tensor produced upstream (env lookup)
+            #   sym_node   -- runtime int from a sym_size node (env lookup)
+            #   shape_list -- list mixing node refs and literals (expand/view
+            #                 target shapes under --dynamic extraction)
+            args = []
+            for entry in args_ordered:
+                kind = entry["kind"]
+                if kind in ("node", "sym_node"):
+                    args.append(env[entry["name"]])
+                elif kind == "shape_list":
+                    args.append(
+                        [
+                            env[item["name"]]
+                            if item["kind"] in ("node", "sym_node")
+                            else item["value"]
+                            for item in entry["items"]
+                        ]
+                    )
         else:
             # Backward compat: graphs serialised before args_ordered was added.
             args = [env[p] for p in (node.get("predecessor_ids") or [])]

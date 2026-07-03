@@ -52,6 +52,9 @@ class HandwrittenDispatchConfig:
     # Operator contract for the emitted autograd-pair seed. None -> LayerNorm
     # (back-compatible default); otherwise any benchmark operator is supported.
     op_spec: Any = None
+    # Extract the AtenIR graph with symbolic shapes so the generated program is
+    # correct at any input shape (no traced dims baked into expand/view/scalars).
+    dynamic_shapes: bool = True
 
 
 # ── graph extraction ──────────────────────────────────────────────────────────
@@ -65,6 +68,8 @@ def _extract_graph(config: HandwrittenDispatchConfig) -> Path:
         "--example-input", config.example_input,
         "--out", str(graph_path),
     ]
+    if config.dynamic_shapes:
+        cmd.append("--dynamic")
     completed = subprocess.run(
         cmd,
         cwd=str(Path(__file__).resolve().parents[2]),
@@ -221,6 +226,14 @@ def generate_dispatch_context(graph_path: Path) -> str:
                     f"- tensor `{entry['name']}`: "
                     f"shape={meta.get('shape')} dtype={meta.get('dtype')}"
                 )
+            elif entry["kind"] == "sym_node":
+                lines.append(f"- symbolic size `{entry['name']}` (runtime int)")
+            elif entry["kind"] == "shape_list":
+                parts = [
+                    f"`{it['name']}`" if it["kind"] in ("node", "sym_node") else repr(it["value"])
+                    for it in entry["items"]
+                ]
+                lines.append(f"- shape list [{', '.join(parts)}]")
             else:
                 lines.append(f"- scalar value={entry['value']!r}")
         lines.append(
