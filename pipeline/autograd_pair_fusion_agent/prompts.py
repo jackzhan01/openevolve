@@ -119,6 +119,9 @@ def grad_reorder(spec: OperatorSpec) -> list[int]:
     reorder: list[int] = []
     for ret in backward_return_names(spec):
         src = ret[1:] if ret.startswith("d") else ret
+        if src not in inputs and src.startswith("_"):
+            # "d_pair_bias" style: separator underscore after the leading d.
+            src = src[1:]
         if src not in inputs:
             raise ValueError(
                 f"backward return {ret!r} does not map to a forward input by the "

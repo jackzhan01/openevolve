@@ -35,8 +35,52 @@ from pathlib import Path
 
 import torch
 import torch.fx as fx
-from torch._decomp import core_aten_decompositions
+from torch._decomp import core_aten_decompositions, get_decompositions
 from torch.fx.experimental.proxy_tensor import make_fx
+
+
+def _decomposition_table():
+    """Core-aten decompositions plus fused ops the core table leaves whole.
+
+    ``aten.native_layer_norm`` (the *forward*) is not in the core table, so a
+    forward that calls ``F.layer_norm`` would land in the joint fwd+bwd trace as
+    one fused node that primitive dispatch cannot lower. Its backward *is* in
+    the core table; request the forward explicitly.
+
+    ``aten.var_mean`` (produced by the layer-norm decomposition) needs the same
+    treatment: as a fused tuple-returning node it only reaches the generic
+    PyTorch fallback, which drops its dim/correction arguments and computes
+    wrong statistics. torch's own var_mean decomposition lowers into prims.*
+    ops (broadcast_in_dim, prims.var) that dispatch cannot lower either, so a
+    small pure-aten decomposition is registered instead — it traces into
+    mean/sub/mul nodes the primitive dispatch already handles.
+    """
+
+    def _var_mean_correction(x, dim=None, *, correction=1, keepdim=False):
+        if dim is None:
+            dim = list(range(x.ndim))
+        elif isinstance(dim, int):
+            dim = [dim]
+        mean = torch.mean(x, dim, True)
+        delta = x - mean
+        var = torch.mean(delta * delta, dim, keepdim)
+        if correction:
+            n = 1
+            for d in dim:
+                n = n * x.shape[d]
+            var = var * (n / (n - correction))
+        if not keepdim:
+            mean = mean.squeeze(dim)
+        return var, mean
+
+    table = dict(core_aten_decompositions())
+    table.update(
+        get_decompositions(
+            [torch.ops.aten.native_layer_norm, torch.ops.aten.native_layer_norm_backward]
+        )
+    )
+    table[torch.ops.aten.var_mean.correction] = _var_mean_correction
+    return table
 
 _DTYPES = {
     "f16": torch.float16,
@@ -199,6 +243,14 @@ def _dim_to_int(d) -> int:
     return int(d)
 
 
+_SYM_TYPES = (torch.SymInt, torch.SymFloat, torch.SymBool)
+
+
+def _sym_hint(v):
+    """Concrete example value for a SymInt/SymFloat/SymBool."""
+    return v.node.hint if isinstance(v, _SYM_TYPES) else v
+
+
 def _node_meta(gm: fx.GraphModule):
     meta = {}
     for n in gm.graph.nodes:
@@ -209,9 +261,10 @@ def _node_meta(gm: fx.GraphModule):
             if any(isinstance(d, torch.SymInt) for d in v.shape):
                 entry["sym_shape"] = [str(d) for d in v.shape]
             meta[n.name] = entry
-        elif isinstance(v, torch.SymInt):
-            # Int-valued node (aten.sym_size.int etc.) from a symbolic trace.
-            meta[n.name] = {"symint": str(v), "hint": _dim_to_int(v)}
+        elif isinstance(v, _SYM_TYPES):
+            # Scalar-valued node from a symbolic trace: SymInt (aten.sym_size.int),
+            # SymFloat (sym_float / scalar arithmetic), or SymBool.
+            meta[n.name] = {"symint": str(v), "hint": _sym_hint(v)}
     return meta
 
 
@@ -235,7 +288,7 @@ def _classify_args(node: fx.Node, meta):
     is_reduction = "sum" in target or "mean" in target
 
     def _is_symint_node(a: fx.Node) -> bool:
-        return isinstance(a.meta.get("val"), torch.SymInt)
+        return isinstance(a.meta.get("val"), _SYM_TYPES)
 
     def _process(a):
         nonlocal keepdim, reduction_dims
@@ -257,9 +310,9 @@ def _classify_args(node: fx.Node, meta):
             else:
                 args_ordered.append({"kind": "scalar", "value": a})
 
-        elif isinstance(a, torch.SymInt):
-            # Raw SymInt arg (no producing node in this graph); fall back to hint.
-            args_ordered.append({"kind": "scalar", "value": _dim_to_int(a)})
+        elif isinstance(a, _SYM_TYPES):
+            # Raw sym arg (no producing node in this graph); fall back to hint.
+            args_ordered.append({"kind": "scalar", "value": _sym_hint(a)})
 
         elif isinstance(a, (int, float)):
             args_ordered.append({"kind": "scalar", "value": a})
@@ -271,7 +324,7 @@ def _classify_args(node: fx.Node, meta):
         elif isinstance(a, (list, tuple)):
             vals, ok = [], True
             for x in a:
-                if isinstance(x, (fx.Node, torch.SymInt)):
+                if isinstance(x, (fx.Node, *_SYM_TYPES)):
                     ok = False
                     break
                 vals.append(x)
@@ -290,7 +343,7 @@ def _classify_args(node: fx.Node, meta):
                     if isinstance(x, fx.Node):
                         kind = "sym_node" if _is_symint_node(x) else "node"
                         items.append({"kind": kind, "name": x.name})
-                    elif isinstance(x, torch.SymInt):
+                    elif isinstance(x, _SYM_TYPES):
                         items.append({"kind": "scalar", "value": _dim_to_int(x)})
                     else:
                         items.append({"kind": "scalar", "value": x})
@@ -379,7 +432,7 @@ def extract_named_op(op_name: str, parsed_args, device: str = "cpu") -> fx.Graph
                 full.append(materialised[j])
         return target(*full)
 
-    return make_fx(wrapped, decomposition_table=core_aten_decompositions())(*tensor_args)
+    return make_fx(wrapped, decomposition_table=_decomposition_table())(*tensor_args)
 
 
 def extract_autograd(
@@ -415,10 +468,10 @@ def extract_autograd(
     if dynamic:
         return make_fx(
             bwd,
-            decomposition_table=core_aten_decompositions(),
+            decomposition_table=_decomposition_table(),
             tracing_mode="symbolic",
         )(grad_out, *fwd_in)
-    return make_fx(bwd, decomposition_table=core_aten_decompositions())(grad_out, *fwd_in)
+    return make_fx(bwd, decomposition_table=_decomposition_table())(grad_out, *fwd_in)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

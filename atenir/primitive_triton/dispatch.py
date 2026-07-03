@@ -105,12 +105,75 @@ def make_kernel(node: dict) -> Callable:  # noqa: C901 (complex but intentionall
 
         return _sym_size
 
+    if "sym_float" in target:
+        # torch.sym_float(SymInt) -> SymFloat, e.g. dim before a **-0.5 scale.
+        def _sym_float(s):
+            return float(s)
+
+        return _sym_float
+
+    if target.startswith("<built-in function ") and n_sym_nodes:
+        # Python scalar arithmetic on symbolic sizes (operator.mul/pow/... nodes
+        # emitted by symbolic tracing, e.g. flattening B*S*H for a view target
+        # or dim ** -0.5 for an attention scale).
+        import operator as _op
+
+        opname = target[len("<built-in function ") :].rstrip(">")
+        fn = getattr(_op, opname, None)
+        if fn is None:
+            raise ValueError(f"unsupported builtin scalar op {target!r}")
+        kinds = [e.get("kind") for e in ao]
+        if kinds == ["sym_node", "sym_node"]:
+            return fn
+        if len(ao) == 2 and kinds.count("sym_node") == 1 and "scalar" in kinds:
+            const = next(e["value"] for e in ao if e["kind"] == "scalar")
+            if kinds[0] == "sym_node":
+
+                def _sym_op_const(s):
+                    return fn(s, const)
+
+                return _sym_op_const
+
+            def _const_op_sym(s):
+                return fn(const, s)
+
+            return _const_op_sym
+        raise ValueError(f"unsupported builtin scalar op arg pattern {kinds!r} for {target!r}")
+
     if has_shape_list and "aten.expand" in target:
 
         def _expand_rt(a, shape):
             return a.expand(tuple(int(s) for s in shape)).contiguous()
 
         return _expand_rt
+
+    if "broadcast_in_dim" in target:
+        # prims.broadcast_in_dim(a, shape, broadcast_dimensions): unsqueeze a to
+        # the output rank (its dims land at broadcast_dimensions), then expand.
+        # Appears in the var_mean decomposition. broadcast_dimensions is always
+        # a literal list; shape may be symbolic (shape_list) or literal.
+        scalar_lists = [v for v in scalar_args if isinstance(v, (list, tuple))]
+        if has_shape_list:
+            bdims = list(scalar_lists[0]) if scalar_lists else []
+
+            def _broadcast_in_dim_rt(a, shape):
+                view = [1] * len(shape)
+                for i, d in enumerate(bdims):
+                    view[d] = a.shape[i]
+                return a.reshape(view).expand(tuple(int(s) for s in shape)).contiguous()
+
+            return _broadcast_in_dim_rt
+
+        shape = list(scalar_lists[0]) if scalar_lists else list(output_shape or [])
+        bdims = list(scalar_lists[1]) if len(scalar_lists) > 1 else []
+
+        def _broadcast_in_dim(a):
+            view = [1] * len(shape)
+            for i, d in enumerate(bdims):
+                view[d] = a.shape[i]
+            return a.reshape(view).expand(tuple(shape)).contiguous()
+
+        return _broadcast_in_dim
 
     if has_shape_list and (
         "aten.view" in target or "aten._unsafe_view" in target or "aten.reshape" in target
@@ -123,13 +186,15 @@ def make_kernel(node: dict) -> Callable:  # noqa: C901 (complex but intentionall
 
     if n_sym_nodes and n_tensors == 1 and ao and ao[0].get("kind") == "node":
         # Pointwise op whose scalar operand is a symbolic size (runtime int).
-        if "aten.div" in target:
+        # Matches both namespaces: aten.div/aten.mul and prims.div/prims.mul
+        # (the latter appear inside decompositions such as var_mean's).
+        if "div" in target:
 
             def _div_sym(a, s):
                 return elementwise.div_scalar(a, float(s))
 
             return _div_sym
-        if "aten.mul" in target:
+        if "mul" in target:
 
             def _mul_sym(a, s):
                 return elementwise.mul_scalar(a, float(s))

@@ -370,6 +370,20 @@ def generate_dispatch_program(graph: dict) -> str:
 
     builder = _ProgramBuilder()
     call_lines: list[str] = []
+    layout_used: set[str] = set()
+
+    def _tuple_expr(entry) -> str:
+        """Render a shape arg (shape_list entry or literal list) as a tuple expr."""
+        if isinstance(entry, dict) and entry.get("kind") == "shape_list":
+            parts = [
+                _pyname(it["name"]) if it["kind"] in ("node", "sym_node") else repr(it["value"])
+                for it in entry["items"]
+            ]
+        else:
+            parts = [repr(int(v)) for v in entry]
+        trailing = "," if len(parts) == 1 else ""
+        return f"({', '.join(parts)}{trailing})"
+
     for node in call_nodes:
         name = node["name"]
         target = node["target"]
@@ -384,6 +398,88 @@ def generate_dispatch_program(graph: dict) -> str:
                 f"    {_pyname(name)} = int({_pyname(src)}.shape[{dim}])  # {name}: {target}"
             )
             continue
+
+        # Scalar arithmetic on symbolic sizes: emit inline Python (these targets
+        # are Python builtins / torch.sym_float, not aten ops — the kernel
+        # builder cannot introspect them, and inline reads better anyway).
+        if "sym_float" in target and args_ordered:
+            src = next(e["name"] for e in args_ordered if e["kind"] == "sym_node")
+            call_lines.append(f"    {_pyname(name)} = float({_pyname(src)})  # {name}: sym_float")
+            continue
+        _PY_BINOPS = {"mul": "*", "add": "+", "sub": "-", "truediv": "/", "floordiv": "//", "mod": "%", "pow": "**"}
+        if target.startswith("<built-in function ") and args_ordered:
+            opname = target[len("<built-in function ") :].rstrip(">")
+            if opname in _PY_BINOPS and len(args_ordered) == 2:
+                exprs = [
+                    _pyname(e["name"]) if e["kind"] in ("node", "sym_node") else repr(e["value"])
+                    for e in args_ordered
+                ]
+                call_lines.append(
+                    f"    {_pyname(name)} = {exprs[0]} {_PY_BINOPS[opname]} {exprs[1]}  # {name}: {opname}"
+                )
+                continue
+
+        # Layout ops: substitute embedded Triton copies / zero-copy forms so the
+        # emitted seed is evolvable Triton instead of opaque PyTorch fallbacks.
+        # atenir's dispatch registry (used for in-process verification) is
+        # unaffected; this rewrites the generated program only.
+        if args_ordered:
+            _node_names = [e["name"] for e in args_ordered if e["kind"] == "node"]
+            _shape_arg = next(
+                (e for e in args_ordered if e.get("kind") == "shape_list"),
+                next((e["value"] for e in args_ordered if e["kind"] == "scalar" and isinstance(e.get("value"), list)), None),
+            )
+            if "aten.alias" in target and len(_node_names) == 1:
+                # aten.alias is identity; inputs in this program are contiguous.
+                call_lines.append(f"    {_pyname(name)} = {_pyname(_node_names[0])}  # {name}: {target} (alias)")
+                continue
+            if ("aten.view" in target or "aten._unsafe_view" in target or "aten.reshape" in target) and (
+                len(_node_names) == 1 and _shape_arg is not None
+            ):
+                # reshape of a contiguous tensor is a zero-copy view (and stays contiguous).
+                call_lines.append(
+                    f"    {_pyname(name)} = {_pyname(_node_names[0])}.reshape{_tuple_expr(_shape_arg)}  # {name}: {target}"
+                )
+                continue
+            if "aten.permute" in target and len(_node_names) == 1 and isinstance(_shape_arg, list):
+                layout_used.add("permute_copy")
+                call_lines.append(
+                    f"    {_pyname(name)} = permute_copy({_pyname(_node_names[0])}, {_tuple_expr(_shape_arg)})  # {name}: {target}"
+                )
+                continue
+            if "aten.expand" in target and len(_node_names) == 1 and _shape_arg is not None:
+                layout_used.add("expand_copy")
+                call_lines.append(
+                    f"    {_pyname(name)} = expand_copy({_pyname(_node_names[0])}, {_tuple_expr(_shape_arg)})  # {name}: {target}"
+                )
+                continue
+            if "broadcast_in_dim" in target and len(_node_names) == 1 and _shape_arg is not None:
+                # prims.broadcast_in_dim = unsqueeze-to-rank (dims at bdims) + expand.
+                _scalar_lists = [
+                    e["value"] for e in args_ordered
+                    if e["kind"] == "scalar" and isinstance(e.get("value"), list)
+                ]
+                _bdims = _scalar_lists[-1] if _scalar_lists else []
+                _rank = (
+                    len(_shape_arg["items"]) if isinstance(_shape_arg, dict) else len(_shape_arg)
+                )
+                src = _pyname(_node_names[0])
+                _bpos = {int(d): i for i, d in enumerate(_bdims)}
+                view_parts = [
+                    f"{src}.shape[{_bpos[d]}]" if d in _bpos else "1" for d in range(_rank)
+                ]
+                trailing = "," if len(view_parts) == 1 else ""
+                layout_used.add("expand_copy")
+                call_lines.append(
+                    f"    {_pyname(name)} = expand_copy({src}.reshape(({', '.join(view_parts)}{trailing})), {_tuple_expr(_shape_arg)})  # {name}: {target}"
+                )
+                continue
+            if "aten.clone" in target and len(_node_names) == 1:
+                layout_used.add("clone_copy")
+                call_lines.append(
+                    f"    {_pyname(name)} = clone_copy({_pyname(_node_names[0])})  # {name}: {target}"
+                )
+                continue
 
         if args_ordered is not None:
             arg_exprs = []
@@ -412,6 +508,10 @@ def generate_dispatch_program(graph: dict) -> str:
 
     placeholder_names = [_pyname(p["name"]) for p in placeholders]
     kernel_library = builder.render_kernel_library()
+    if layout_used:
+        from pipeline.handwritten_dispatch.layout_kernels import embeddable_source
+
+        kernel_library = kernel_library.rstrip("\n") + "\n\n\n" + embeddable_source()
 
     header = '''"""Auto-generated by Pipeline D (handwritten_dispatch) — a self-contained,
 dispatch-free Triton program for one AtenIR graph.
