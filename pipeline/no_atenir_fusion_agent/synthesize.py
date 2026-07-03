@@ -38,6 +38,12 @@ class NoAtenIRFusionConfig:
     timeout: int
     python: str
     dry_run: bool = False
+    # Evaluator used to verify generated programs. Defaults to LayerNorm for
+    # back-compat; point at another benchmark's evaluator_autograd_pair.py to run
+    # the ablation on a different operator.
+    evaluator: str = "benchmark/triton_layernorm_backward_bench/evaluator_autograd_pair.py"
+    # Operator contract for the prompts. None -> LayerNorm (back-compatible).
+    op_spec: Any = None
 
 
 def _strip_code_fence(text: str) -> str:
@@ -64,7 +70,7 @@ def _forward_source(forward: str) -> str:
 def _verify_program(config: NoAtenIRFusionConfig, program_path: Path) -> dict:
     cmd = [
         config.python,
-        "benchmark/triton_layernorm_backward_bench/evaluator_autograd_pair.py",
+        config.evaluator,
         str(program_path),
     ]
     completed = subprocess.run(
@@ -156,6 +162,7 @@ def synthesize_no_atenir_fusion(config: NoAtenIRFusionConfig) -> int:
     plan_prompt = render_plan_prompt(
         forward=config.forward,
         forward_source=forward_source,
+        spec=config.op_spec,
     )
     (config.output_dir / "plan_prompt.md").write_text(plan_prompt, encoding="utf-8")
 
@@ -164,6 +171,7 @@ def synthesize_no_atenir_fusion(config: NoAtenIRFusionConfig) -> int:
             forward=config.forward,
             forward_source=forward_source,
             plan="{PLAN_FROM_LLM}",
+            spec=config.op_spec,
         )
         dry_dir = config.output_dir / "attempt_001"
         dry_dir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +189,7 @@ def synthesize_no_atenir_fusion(config: NoAtenIRFusionConfig) -> int:
         forward=config.forward,
         forward_source=forward_source,
         plan=plan,
+        spec=config.op_spec,
     )
     previous_code = ""
 
@@ -224,6 +233,7 @@ def synthesize_no_atenir_fusion(config: NoAtenIRFusionConfig) -> int:
             plan=plan,
             previous_code=code or previous_code,
             verifier_report=json.dumps(report, indent=2, sort_keys=True),
+            spec=config.op_spec,
         )
         (attempt_dir / "repair_prompt.md").write_text(repair_prompt, encoding="utf-8")
         prompt = repair_prompt

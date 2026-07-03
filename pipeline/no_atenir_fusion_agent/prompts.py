@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pipeline.autograd_pair_fusion_agent.prompts import OperatorSpec
+
 
 SYSTEM_MESSAGE = """You are a Triton compiler engineer.
 You synthesize a forward/backward autograd pair directly from a PyTorch forward
@@ -58,11 +60,85 @@ Triton pitfalls:
 """
 
 
+# Generic saved-tensor guidance + Triton pitfalls, identical wording to the tail
+# of PAIR_RULES above but reusable for any operator's spec-driven rules block.
+_GENERIC_GUIDANCE_AND_PITFALLS = """Saved-tensor guidance:
+
+- The saved tensor tuple is part of the evolvable program state. You may save
+  original inputs and/or forward-computed intermediates.
+- Prefer compact saved state such as per-row statistics over full
+  activation-sized tensors when the backward can cheaply reconstruct them.
+- Avoid saving tensors with the same shape as a large activation unless the
+  latency benefit clearly outweighs the memory cost.
+- The evaluator reports saved memory so OpenEvolve can optimize the tradeoff.
+
+Triton pitfalls:
+
+- `tl.arange` bounds must be compile-time constants. Use a `BLOCK_*:
+  tl.constexpr` meta-parameter and mask inactive lanes.
+- Do not read Python globals inside `@triton.jit` kernels. Pass eps, dimensions,
+  strides, and other scalars as kernel arguments or meta-parameters.
+- Do not hard-code traced dimensions such as 64, 128, or 1024 unless they are
+  semantic constants. Derive runtime dimensions from input tensors.
+- Use fp32 accumulation for reductions.
+- Output dtypes must match the public API contract.
+- Allocate outputs with `torch.empty_like` / `torch.zeros_like` where possible.
+"""
+
+
+def render_pair_rules(spec: OperatorSpec | None = None) -> str:
+    """Return the ## Autograd-pair rules block.
+
+    ``spec is None`` -> the LayerNorm ``PAIR_RULES`` verbatim (back-compatible
+    default).  Otherwise the API contract and semantics are taken from ``spec`` so
+    the ablation targets any benchmark operator.
+    """
+    if spec is None:
+        return PAIR_RULES
+    no_grad = ""
+    if spec.no_grad_inputs:
+        names = ", ".join(f"`{n}`" for n in spec.no_grad_inputs)
+        no_grad = (
+            f"- The following inputs are not trainable; do not return gradients for "
+            f"them: {names}. The evaluator wrapper inserts None in their positions.\n"
+        )
+    extra = f"\n{spec.extra_constraints}\n" if spec.extra_constraints else ""
+    return f"""## Autograd-pair rules
+
+Public API to implement:
+
+```python
+def {spec.forward_fn_name}({spec.forward_args}):
+    return y, saved_tensors
+
+def {spec.backward_fn_name}({spec.backward_args}):
+    return {spec.backward_returns}
+```
+
+Hard constraints:
+
+- Return only Python source, no Markdown.
+- Include imports for `torch`, `triton`, and `triton.language as tl`.
+- Include an `EVOLVE-BLOCK` around generated Triton kernels and launch helpers.
+- Do not call PyTorch autograd or a high-level PyTorch reference of this operator
+  in the generated math.
+- {spec.forward_semantics}
+- {spec.backward_semantics}
+- Backward must consume only the upstream gradient, `saved_tensors`, and `eps`
+  (when the forward takes one).
+- `saved_tensors` must be a tensor or tuple/list of tensors, because the
+  evaluator stores them via `ctx.save_for_backward`.
+{no_grad}
+{_GENERIC_GUIDANCE_AND_PITFALLS}{extra}"""
+
+
 def render_plan_prompt(
     *,
     forward: str,
     forward_source: str,
+    spec: OperatorSpec | None = None,
 ) -> str:
+    forward_fn_name = spec.forward_fn_name if spec is not None else "layernorm_forward_with_saved"
     return f"""# No-AtenIR Autograd-Pair Planning
 
 This is an ablation. You must derive the forward saved-tensor contract and
@@ -84,7 +160,7 @@ Forward reference source:
 Task:
 
 1. Derive the mathematical backward formula from the forward source.
-2. Propose a saved tensor contract for `layernorm_forward_with_saved`.
+2. Propose a saved tensor contract for `{forward_fn_name}`.
 3. Propose Triton kernels for forward and backward.
 4. Identify reductions, reduction axes, accumulation dtypes, and output dtypes.
 5. Explain the memory/speed tradeoff of the saved tensors.
@@ -98,6 +174,7 @@ def render_codegen_prompt(
     forward: str,
     forward_source: str,
     plan: str,
+    spec: OperatorSpec | None = None,
 ) -> str:
     return f"""# No-AtenIR Autograd-Pair Codegen
 
@@ -107,7 +184,7 @@ and the plan only. No AtenIR backward graph is provided.
 
 Requirements:
 
-{PAIR_RULES}
+{render_pair_rules(spec)}
 
 Forward reference spec:
 
@@ -136,6 +213,7 @@ def render_repair_prompt(
     plan: str,
     previous_code: str,
     verifier_report: str,
+    spec: OperatorSpec | None = None,
 ) -> str:
     return f"""# No-AtenIR Autograd-Pair Repair
 
@@ -173,7 +251,7 @@ Previous code:
 {previous_code}
 ```
 
-{PAIR_RULES}
+{render_pair_rules(spec)}
 
 Before writing the repaired code, internally classify the failure as a formula
 error, saved-tensor contract error, reduction-axis error, shape/tiling error,

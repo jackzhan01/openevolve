@@ -30,11 +30,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--op-spec",
+        default=None,
+        metavar="JSON_FILE",
+        help=(
+            "Path to an operator spec JSON (same format as Pipeline A's "
+            "<op>_spec.json). When omitted, the LayerNorm contract is used."
+        ),
+    )
+    parser.add_argument(
+        "--evaluator",
+        default="benchmark/triton_layernorm_backward_bench/evaluator_autograd_pair.py",
+        help="Evaluator (relative to repo root) used to verify generated programs.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    op_spec = None
+    if args.op_spec:
+        from pipeline.autograd_pair_fusion_agent.prompts import load_op_spec
+
+        op_spec = load_op_spec(args.op_spec)
     return synthesize_no_atenir_fusion(
         NoAtenIRFusionConfig(
             forward=args.forward,
@@ -48,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             python=args.python,
             dry_run=args.dry_run,
+            evaluator=args.evaluator,
+            op_spec=op_spec,
         )
     )
 

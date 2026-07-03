@@ -57,11 +57,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Also write initial_program_autograd_pair.py wrapping dispatch_program.py with saved_tensors API",
     )
+    parser.add_argument(
+        "--op-spec",
+        default=None,
+        metavar="JSON_FILE",
+        help=(
+            "Path to an operator spec JSON (same format as Pipeline A's "
+            "<op>_spec.json) describing the autograd-pair contract for the emitted "
+            "seed. When omitted, the LayerNorm contract is used (back-compatible)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    op_spec = None
+    if args.op_spec:
+        from pipeline.autograd_pair_fusion_agent.prompts import load_op_spec
+
+        op_spec = load_op_spec(args.op_spec)
     return synthesize_handwritten_dispatch(
         HandwrittenDispatchConfig(
             forward=args.forward,
@@ -74,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             fp16_rtol=args.fp16_rtol,
             python=args.python,
             emit_autograd_pair_seed=args.emit_autograd_pair_seed,
+            op_spec=op_spec,
         )
     )
 

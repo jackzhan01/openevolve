@@ -117,6 +117,60 @@ openevolve-run \
   --output /u/wzhan/tmp/openevolve_layernorm_<pipeline>_10
 ```
 
+## Running A/B/C on Other Benchmarks
+
+All three pipelines are now operator-generic. The LayerNorm contract is still
+the default (existing commands are unchanged), but each pipeline accepts an
+`--op-spec <op>_spec.json` to target another benchmark. Four operators ship with
+the full asset set (op-spec + autograd-pair evaluator + speed/memory config +
+reference seed):
+
+| Operator | op-spec (`pipeline/autograd_pair_fusion_agent/`) | forward ref | `--example-input` |
+|---|---|---|---|
+| rmsnorm | `rmsnorm_spec.json` | `benchmark.triton_rmsnorm_backward_bench.forward_ref:rmsnorm_forward_ref` | `"[(8,64) f32, (64) f32]"` |
+| matmul | `matmul_spec.json` | `benchmark.triton_matmul_backward_bench.forward_ref:matmul_forward_ref` | `"[(64,64) f32, (64,64) f32]"` |
+| linear | `linear_spec.json` | `benchmark.triton_linear_backward_bench.forward_ref:linear_forward_ref` | `"[(64,64) f32, (64,64) f32, (64) f32]"` |
+| layernorm_linear | `layernorm_linear_spec.json` | `benchmark.triton_layernorm_linear_backward_bench.forward_ref:layernorm_linear_forward_ref` | `"[(64,128) f32, (128) f32, (128) f32, (128,256) f32]"` |
+
+Example for **rmsnorm** (swap the op-spec / forward / example-input / bench dir
+for the others):
+
+```bash
+# Pipeline A — AtenIR autograd-pair fusion agent
+python -m pipeline.run_pipeline_a_autograd_pair \
+  --forward benchmark.triton_rmsnorm_backward_bench.forward_ref:rmsnorm_forward_ref \
+  --example-input "[(8,64) f32, (64) f32]" \
+  --op-spec pipeline/autograd_pair_fusion_agent/rmsnorm_spec.json \
+  --evaluator benchmark/triton_rmsnorm_backward_bench/evaluator_autograd_pair.py \
+  --output-dir /tmp/A_rmsnorm --model gpt-5.5 --max-attempts 3
+
+# Pipeline B — LLM-free hand-written dispatch seed
+python -m pipeline.run_pipeline_b_handwritten_dispatch \
+  --forward benchmark.triton_rmsnorm_backward_bench.forward_ref:rmsnorm_forward_ref \
+  --example-input "[(8,64) f32, (64) f32]" \
+  --op-spec pipeline/autograd_pair_fusion_agent/rmsnorm_spec.json \
+  --output-dir /tmp/B_rmsnorm --dtype float32 --dtype float16 \
+  --emit-autograd-pair-seed
+
+# Pipeline C — no-AtenIR baseline
+python -m pipeline.run_pipeline_c_no_atenir \
+  --forward benchmark.triton_rmsnorm_backward_bench.forward_ref:rmsnorm_forward_ref \
+  --op-spec pipeline/autograd_pair_fusion_agent/rmsnorm_spec.json \
+  --evaluator benchmark/triton_rmsnorm_backward_bench/evaluator_autograd_pair.py \
+  --output-dir /tmp/C_rmsnorm --model gpt-5.5 --max-attempts 3
+```
+
+Then run the common OpenEvolve speed/memory step against the matching
+`benchmark/triton_rmsnorm_backward_bench/evaluator_autograd_pair_speed_memory.py`
+and `config_autograd_pair_speed_memory.yaml`.
+
+> The new bench assets were authored without a CUDA environment available, so
+> they are validated by inspection + `py_compile` only. Smoke-test each bench's
+> reference seed once on a GPU before a full A/B/C run, e.g.
+> `python benchmark/triton_rmsnorm_backward_bench/evaluator_autograd_pair.py \`
+> `       benchmark/triton_rmsnorm_backward_bench/initial_program_autograd_pair.py`
+> (expect `"correct": 1.0`).
+
 ## Development / Historical Pipelines
 
 The following directories are useful development artifacts but are not the main

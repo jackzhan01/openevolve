@@ -49,6 +49,9 @@ class HandwrittenDispatchConfig:
     fp16_rtol: float
     python: str
     emit_autograd_pair_seed: bool = False
+    # Operator contract for the emitted autograd-pair seed. None -> LayerNorm
+    # (back-compatible default); otherwise any benchmark operator is supported.
+    op_spec: Any = None
 
 
 # ── graph extraction ──────────────────────────────────────────────────────────
@@ -360,7 +363,9 @@ def synthesize_handwritten_dispatch(config: HandwrittenDispatchConfig) -> int:
         program_path.write_text(program, encoding="utf-8")
         print(f"  → {program_path} ({len(program)} chars)")
         if config.emit_autograd_pair_seed:
-            pair_program = generate_autograd_pair_program(graph, forward=config.forward)
+            pair_program = generate_autograd_pair_program(
+                graph, forward=config.forward, op_spec=config.op_spec
+            )
             pair_path = config.output_dir / "initial_program_autograd_pair.py"
             pair_path.write_text(pair_program, encoding="utf-8")
             print(f"  → {pair_path} ({len(pair_program)} chars)")

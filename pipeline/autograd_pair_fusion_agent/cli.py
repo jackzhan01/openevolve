@@ -3,31 +3,18 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
-from pipeline.autograd_pair_fusion_agent.prompts import LAYERNORM_SPEC, OperatorSpec
+from pipeline.autograd_pair_fusion_agent.prompts import (
+    LAYERNORM_SPEC,
+    OperatorSpec,
+    load_op_spec as _load_op_spec,
+)
 from pipeline.autograd_pair_fusion_agent.synthesize import (
     AutogradPairConfig,
     synthesize_autograd_pair,
 )
-
-
-def _load_op_spec(path: str) -> OperatorSpec:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    no_grad = data.get("no_grad_inputs", [])
-    return OperatorSpec(
-        forward_fn_name=data["forward_fn_name"],
-        forward_args=data["forward_args"],
-        backward_fn_name=data["backward_fn_name"],
-        backward_args=data["backward_args"],
-        backward_returns=data["backward_returns"],
-        forward_semantics=data["forward_semantics"],
-        backward_semantics=data["backward_semantics"],
-        no_grad_inputs=tuple(no_grad),
-        extra_constraints=data.get("extra_constraints", ""),
-    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

@@ -427,15 +427,7 @@ import triton.language.extra.cuda.libdevice as libdevice
     return "\n".join(lines) + "\n"
 
 
-def generate_autograd_pair_program(graph: dict, *, forward: str) -> str:
-    """Build an autograd-pair seed around the dispatch-free backward program.
-
-    The backward uses the generated `run_graph_program` call sequence. The
-    initial saved-tensor policy is deliberately conservative: save only original
-    inputs and let OpenEvolve modify the EVOLVE-BLOCK later.
-    """
-    source = generate_dispatch_program(graph)
-    wrapper = f'''
+_LAYERNORM_AUTOGRAD_PAIR_WRAPPER = '''
 
 _FORWARD_SPEC = {forward!r}
 
@@ -475,6 +467,28 @@ def layernorm_forward_with_saved(x, weight, bias, eps=1e-5):
 def layernorm_backward_from_saved(dy, saved_tensors, eps=1e-5):
     return _backward_from_saved_impl(dy, saved_tensors, eps)
 '''
+
+
+def generate_autograd_pair_program(graph: dict, *, forward: str, op_spec: "OperatorSpec | None" = None) -> str:
+    """Build an autograd-pair seed around the dispatch-free backward program.
+
+    The backward uses the generated `run_graph_program` call sequence. The
+    initial saved-tensor policy is deliberately conservative: save only original
+    inputs and let OpenEvolve modify the EVOLVE-BLOCK later.
+
+    ``op_spec`` selects the operator contract.  When omitted, the LayerNorm
+    wrapper is emitted verbatim (back-compatible default); otherwise the wrapper
+    is derived from the spec so any benchmark operator is supported.
+    """
+    source = generate_dispatch_program(graph)
+    if op_spec is None:
+        wrapper = _LAYERNORM_AUTOGRAD_PAIR_WRAPPER.format(forward=forward)
+    else:
+        from pipeline.autograd_pair_fusion_agent.prompts import (
+            render_dispatch_autograd_pair_wrapper,
+        )
+
+        wrapper = render_dispatch_autograd_pair_wrapper(forward, op_spec)
     marker = "# EVOLVE-BLOCK-END"
     if marker not in source:
         return source + wrapper

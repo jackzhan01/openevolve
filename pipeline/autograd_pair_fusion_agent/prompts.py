@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,157 @@ LAYERNORM_SPEC = OperatorSpec(
         "Return `dx` with `x` dtype, `dweight` with `weight` dtype, and `dbias` with `bias` dtype."
     ),
 )
+
+
+def load_op_spec(path: str | Path) -> OperatorSpec:
+    """Load an :class:`OperatorSpec` from a JSON file.
+
+    Shared by all three autograd-pair pipelines (A's fusion agent, B's
+    handwritten dispatch seed wrapper, and C's no-AtenIR ablation) so a single
+    ``<op>_spec.json`` describes one operator everywhere.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return OperatorSpec(
+        forward_fn_name=data["forward_fn_name"],
+        forward_args=data["forward_args"],
+        backward_fn_name=data["backward_fn_name"],
+        backward_args=data["backward_args"],
+        backward_returns=data["backward_returns"],
+        forward_semantics=data["forward_semantics"],
+        backward_semantics=data["backward_semantics"],
+        no_grad_inputs=tuple(data.get("no_grad_inputs", [])),
+        extra_constraints=data.get("extra_constraints", ""),
+    )
+
+
+# ── Signature derivation helpers ────────────────────────────────────────────
+# These parse the (string) signatures on an OperatorSpec into structured pieces
+# that the deterministic Pipeline B wrapper and the Pipeline C prompts both
+# need.  They rely on two conventions the autograd-pair specs already follow:
+#   * the only keyword/default arg is ``eps`` (everything else is a tensor input);
+#   * each gradient return is ``"d" + <forward input name>`` (dx<-x, dweight<-weight,
+#     dbias<-bias, da<-a, db<-b, dlinear_weight<-linear_weight, ...).
+
+
+def _arg_names(arg_str: str) -> list[str]:
+    return [a.split("=", 1)[0].strip() for a in arg_str.split(",") if a.strip()]
+
+
+def forward_input_names(spec: OperatorSpec) -> list[str]:
+    """Ordered tensor inputs of the forward (eps excluded), matching the forward
+    reference signature and therefore the AtenIR graph's ``placeholders[1:]``."""
+    return [a for a in _arg_names(spec.forward_args) if a != "eps"]
+
+
+def forward_has_eps(spec: OperatorSpec) -> bool:
+    return "eps" in _arg_names(spec.forward_args)
+
+
+def grad_output_name(spec: OperatorSpec) -> str:
+    """Name of the upstream gradient (e.g. ``dy``/``dc``/``do``/``dout``); the
+    first positional arg of the backward, matching the graph's ``placeholders[0]``."""
+    return _arg_names(spec.backward_args)[0]
+
+
+def backward_return_names(spec: OperatorSpec) -> list[str]:
+    return [r.strip() for r in spec.backward_returns.split(",") if r.strip()]
+
+
+def grad_reorder(spec: OperatorSpec) -> list[int]:
+    """Permutation mapping ``run_graph_program`` outputs (in forward-input order)
+    to ``backward_returns`` order.
+
+    ``run_graph`` returns gradients in forward-input order (it differentiates the
+    forward inputs in signature order); the evaluator expects them in
+    ``backward_returns`` order.  For most ops these coincide (identity), but fused
+    ops such as LayerNorm->Linear list ``dlinear_weight`` before ``dweight``.
+    """
+    inputs = forward_input_names(spec)
+    reorder: list[int] = []
+    for ret in backward_return_names(spec):
+        src = ret[1:] if ret.startswith("d") else ret
+        if src not in inputs:
+            raise ValueError(
+                f"backward return {ret!r} does not map to a forward input by the "
+                f"'d'+name convention (forward inputs: {inputs}); add an explicit "
+                "mapping for this operator."
+            )
+        reorder.append(inputs.index(src))
+    return reorder
+
+
+def render_dispatch_autograd_pair_wrapper(forward: str, spec: OperatorSpec) -> str:
+    """Render Pipeline B's autograd-pair seed wrapper for an arbitrary operator.
+
+    Pure string construction (no torch/triton), so it can be unit-tested without
+    a GPU.  ``run_graph_program`` (emitted by the dispatch codegen) returns
+    gradients in forward-input order; the evaluator expects ``backward_returns``
+    order, so the reorder from :func:`grad_reorder` is applied here.
+    """
+    inputs = forward_input_names(spec)
+    has_eps = forward_has_eps(spec)
+    grad_out = grad_output_name(spec)
+    reorder = grad_reorder(spec)
+
+    fwd_call = ", ".join(inputs + (["eps"] if has_eps else []))
+    saved = ", ".join(f"{n}.contiguous()" for n in inputs)
+    saved_tuple = f"({saved},)" if len(inputs) == 1 else f"({saved})"
+    unpack = f"{', '.join(inputs)} = saved_tensors[:{len(inputs)}]"
+    run_args = ",\n        ".join(
+        [f"{grad_out}.contiguous()"] + [f"{n}.contiguous()" for n in inputs]
+    )
+    eps_marker = "    _ = eps\n" if has_eps else ""
+
+    if reorder == list(range(len(reorder))):
+        backward_body = (
+            f"{eps_marker}"
+            f"    {unpack}\n"
+            f"    return run_graph_program(\n        {run_args},\n    )"
+        )
+    else:
+        ret = ", ".join(f"_grads[{i}]" for i in reorder)
+        backward_body = (
+            f"{eps_marker}"
+            f"    {unpack}\n"
+            f"    _grads = run_graph_program(\n        {run_args},\n    )\n"
+            f"    return ({ret})"
+        )
+
+    backward_call = ", ".join([grad_out, "saved_tensors"] + (["eps"] if has_eps else []))
+
+    return f'''
+
+_FORWARD_SPEC = {forward!r}
+
+
+def _load_forward_callable():
+    module_name, fn_name = (
+        _FORWARD_SPEC.split(":", 1)
+        if ":" in _FORWARD_SPEC
+        else _FORWARD_SPEC.rsplit(".", 1)
+    )
+    module = __import__(module_name, fromlist=[fn_name])
+    return getattr(module, fn_name)
+
+
+def _forward_with_saved_impl({spec.forward_args}):
+    # Conservative seed: only save original forward inputs. OpenEvolve may
+    # replace this with saved intermediates.
+    y = _load_forward_callable()({fwd_call})
+    return y, {saved_tuple}
+
+
+def _backward_from_saved_impl({spec.backward_args}):
+{backward_body}
+
+
+def {spec.forward_fn_name}({spec.forward_args}):
+    return _forward_with_saved_impl({fwd_call})
+
+
+def {spec.backward_fn_name}({spec.backward_args}):
+    return _backward_from_saved_impl({backward_call})
+'''
 
 
 SYSTEM_MESSAGE = """You are a Triton compiler engineer.
