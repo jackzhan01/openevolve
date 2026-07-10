@@ -445,10 +445,11 @@ def _run_iteration_worker(
 
         iteration_time = time.time() - iteration_start
 
-        # Firewall: ncu_report_path must never reach the database — artifacts are
-        # rendered into future prompts, and the evolver must not see NCU data.
+        # Firewall: no ncu_* artifact (report path, profile errors, ...) may reach the
+        # database — artifacts are rendered into future prompts, and the evolver must
+        # not see NCU data.
         if artifacts:
-            artifacts.pop("ncu_report_path", None)
+            artifacts = {k: v for k, v in artifacts.items() if not k.startswith("ncu_")}
 
         # Get target island from snapshot (where child should be placed)
         target_island = db_snapshot.get("sampling_island")

@@ -66,8 +66,7 @@ DEFAULT_METRICS: tuple[str, ...] = (
     "smsp__sass_inst_executed_op_local_st.sum",  # Pattern K
 )
 
-_IMPORT_PREAMBLE = textwrap.dedent(
-    """\
+_IMPORT_PREAMBLE = textwrap.dedent("""\
     import importlib.util
     import sys
     from pathlib import Path
@@ -90,8 +89,7 @@ _IMPORT_PREAMBLE = textwrap.dedent(
     backward_fn = getattr(module, "layernorm_backward_from_saved")
 
     case = task_spec.TestCase({rows}, {cols}, {dtype_name!r}, {atol}, {rtol})
-    """
-)
+    """)
 
 # Phase 1, run WITHOUT ncu: generates inputs (the RNG kernels behind that must
 # not show up in the profile) and runs `warmup` iterations so Triton's JIT
@@ -99,8 +97,7 @@ _IMPORT_PREAMBLE = textwrap.dedent(
 # by default, shared across processes) before ncu ever attaches. The exact
 # input tensors are then saved so phase 2 reuses them byte-for-byte rather
 # than regenerating (and re-launching RNG kernels for) them.
-_WARMUP_TEMPLATE = _IMPORT_PREAMBLE + textwrap.dedent(
-    """\
+_WARMUP_TEMPLATE = _IMPORT_PREAMBLE + textwrap.dedent("""\
     torch.manual_seed(task_spec.seed_for_case(case))
     dy, x, weight, bias, eps = task_spec.make_inputs(torch, case)
 
@@ -110,16 +107,14 @@ _WARMUP_TEMPLATE = _IMPORT_PREAMBLE + textwrap.dedent(
     torch.cuda.synchronize()
 
     torch.save({{"dy": dy, "x": x, "weight": weight, "bias": bias, "eps": eps}}, {inputs_path!r})
-    """
-)
+    """)
 
 # Phase 2, run UNDER ncu: loads the exact inputs phase 1 produced and makes
 # exactly one forward+backward call -- no RNG kernels, no repeated warmup
 # calls, nothing else in this process's lifetime for ncu to capture besides
 # the candidate's own kernels (ncu profiles the whole process by default,
 # there is no implicit "just the last call" boundary).
-_PROFILED_TEMPLATE = _IMPORT_PREAMBLE + textwrap.dedent(
-    """\
+_PROFILED_TEMPLATE = _IMPORT_PREAMBLE + textwrap.dedent("""\
     saved_inputs = torch.load({inputs_path!r}, map_location="cuda")
     dy, x, weight, bias, eps = (
         saved_inputs["dy"],
@@ -132,8 +127,7 @@ _PROFILED_TEMPLATE = _IMPORT_PREAMBLE + textwrap.dedent(
     y, saved = forward_fn(x, weight, bias, eps)
     backward_fn(dy, saved, eps)
     torch.cuda.synchronize()
-    """
-)
+    """)
 
 
 @dataclass
@@ -161,7 +155,12 @@ class ProfileResult:
             "top_rule": self.top_rule,
             "report_path": self.report_path,
             "kernels": [
-                {"name": k.name, "duration_ns": k.duration_ns, "metrics": k.metrics, "top_rule": k.top_rule}
+                {
+                    "name": k.name,
+                    "duration_ns": k.duration_ns,
+                    "metrics": k.metrics,
+                    "top_rule": k.top_rule,
+                }
                 for k in self.kernels
             ],
         }
@@ -267,7 +266,9 @@ def _iter_indexed(obj, by_idx_name: str, count_name: str) -> Iterator[Any]:
         i += 1
 
 
-def _write_warmup_script(tmp_dir: Path, program_path: str, case, warmup: int, inputs_path: Path) -> Path:
+def _write_warmup_script(
+    tmp_dir: Path, program_path: str, case, warmup: int, inputs_path: Path
+) -> Path:
     content = _WARMUP_TEMPLATE.format(
         repo_root=str(REPO_ROOT),
         bench_dir=str(BENCHMARK_DIR),
@@ -423,7 +424,12 @@ def run_ncu_profile(
                     pass
 
                 kernels.append(
-                    KernelProfile(name=action.name(), duration_ns=duration, metrics=kmetrics, top_rule=top_rule)
+                    KernelProfile(
+                        name=action.name(),
+                        duration_ns=duration,
+                        metrics=kmetrics,
+                        top_rule=top_rule,
+                    )
                 )
 
         # Copy the report out before the TemporaryDirectory is deleted.
@@ -471,11 +477,18 @@ def run_ncu_profile(
     for k in kernels:
         if k.top_rule and (
             overall_top_rule is None
-            or k.top_rule.get("estimated_speedup_pct", -1) > overall_top_rule.get("estimated_speedup_pct", -1)
+            or k.top_rule.get("estimated_speedup_pct", -1)
+            > overall_top_rule.get("estimated_speedup_pct", -1)
         ):
             overall_top_rule = k.top_rule
 
-    return ProfileResult(ok=True, kernels=kernels, aggregate=aggregate, top_rule=overall_top_rule, report_path=persistent_report_path)
+    return ProfileResult(
+        ok=True,
+        kernels=kernels,
+        aggregate=aggregate,
+        top_rule=overall_top_rule,
+        report_path=persistent_report_path,
+    )
 
 
 def derive_flags(aggregate: dict[str, Any]) -> dict[str, Any]:
@@ -524,25 +537,40 @@ def classify_patterns(aggregate: dict[str, Any]) -> dict[str, dict[str, Any]]:
     waves = g("launch__waves_per_multiprocessor")
     grid_size = g("launch__grid_size")
     sm_count = g("device__attribute_multiprocessor_count")
-    small_grid = bool((waves is not None and waves < 0.5) or (grid_size is not None and sm_count is not None and grid_size < sm_count))
+    small_grid = bool(
+        (waves is not None and waves < 0.5)
+        or (grid_size is not None and sm_count is not None and grid_size < sm_count)
+    )
     small_grid_evidence = f"launch__waves_per_multiprocessor={waves}, launch__grid_size={grid_size}, device__attribute_multiprocessor_count={sm_count} (Pattern A: waves<0.5 or grid_size<sm_count)"
 
     long_scoreboard = g("smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio")
     dram_bytes_pct = g("dram__bytes_read.sum.pct_of_peak_sustained_elapsed")
     latency_bound = bool(
-        long_scoreboard is not None and long_scoreboard > 3 and dram_bytes_pct is not None and dram_bytes_pct < 10
+        long_scoreboard is not None
+        and long_scoreboard > 3
+        and dram_bytes_pct is not None
+        and dram_bytes_pct < 10
     )
     latency_bound_evidence = f"long_scoreboard_ratio={long_scoreboard}, dram_bytes_read_pct={dram_bytes_pct} (Pattern E: ratio>3 and dram_pct<10)"
 
     bandwidth_bound = bool(dram_bytes_pct is not None and dram_bytes_pct >= 80)
-    bandwidth_bound_evidence = f"dram_bytes_read_pct={dram_bytes_pct} (Dimension 6: >=80 is genuinely bandwidth-bound)"
+    bandwidth_bound_evidence = (
+        f"dram_bytes_read_pct={dram_bytes_pct} (Dimension 6: >=80 is genuinely bandwidth-bound)"
+    )
 
     theoretical_occ = g("sm__maximum_warps_per_active_cycle_pct")
     achieved_occ = g("sm__warps_active.avg.pct_of_peak_sustained_active")
     occupancy_gap = (
-        (theoretical_occ - achieved_occ) if (theoretical_occ is not None and achieved_occ is not None) else None
+        (theoretical_occ - achieved_occ)
+        if (theoretical_occ is not None and achieved_occ is not None)
+        else None
     )
-    occupancy_limited = bool(theoretical_occ is not None and achieved_occ is not None and theoretical_occ > 50 and achieved_occ < 50)
+    occupancy_limited = bool(
+        theoretical_occ is not None
+        and achieved_occ is not None
+        and theoretical_occ > 50
+        and achieved_occ < 50
+    )
     occupancy_evidence = f"theoretical_occupancy_pct={theoretical_occ}, achieved_occupancy_pct={achieved_occ}, gap={occupancy_gap} (Pattern J: theoretical>50 and achieved<50)"
 
     local_ld = g("smsp__sass_inst_executed_op_local_ld.sum") or 0
@@ -552,8 +580,16 @@ def classify_patterns(aggregate: dict[str, Any]) -> dict[str, dict[str, Any]]:
     register_spill_evidence = f"local_ld={local_ld}, local_st={local_st}, registers_per_thread={regs} (Pattern K: ld/st>0 or registers>128)"
 
     return {
-        "small_grid": {"flag": small_grid, "pattern": "A - small grid / SM idle", "evidence": small_grid_evidence},
-        "latency_bound": {"flag": latency_bound, "pattern": "E - latency-bound", "evidence": latency_bound_evidence},
+        "small_grid": {
+            "flag": small_grid,
+            "pattern": "A - small grid / SM idle",
+            "evidence": small_grid_evidence,
+        },
+        "latency_bound": {
+            "flag": latency_bound,
+            "pattern": "E - latency-bound",
+            "evidence": latency_bound_evidence,
+        },
         "bandwidth_bound": {
             "flag": bandwidth_bound,
             "pattern": "Dimension 6 - bandwidth-bound",

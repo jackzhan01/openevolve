@@ -74,12 +74,6 @@ prompt:
     Do not call PyTorch autograd or high-level attention APIs in the generated math.
     Prefer Triton kernels for core forward/backward work.
 
-    Hardware feedback:
-    Every correct candidate is profiled with Nsight Compute.
-    Hardware metrics are collected for telemetry but do NOT affect the score or this prompt.
-    A separate NCU optimization pass may silently improve a candidate's kernel between
-    iterations — if it scores higher, it replaces the original transparently.
-
 database:
   population_size: 30
   archive_size: 20

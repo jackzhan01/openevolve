@@ -48,6 +48,7 @@ pr_sanity*/
 .pytest_cache/
 .coverage
 htmlcov/
+tmp/
 
 # Misc
 .DS_Store
