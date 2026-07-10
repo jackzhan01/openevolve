@@ -345,10 +345,25 @@ class Evaluator:
             Exception: If evaluation function raises an exception
         """
 
-        # Create a coroutine that runs the evaluation function in an executor
+        # Run the evaluation in a DAEMON thread rather than the default executor.
+        # If the evaluated code hangs (e.g. a deadlocked GPU kernel), asyncio.wait_for
+        # fires below — but a default-executor thread would then block asyncio.run()
+        # forever at shutdown (shutdown_default_executor waits for it). A daemon thread
+        # is abandoned instead, so the worker process can return the timeout result.
+        import threading
+        from concurrent.futures import Future as _CFuture
+
         async def run_evaluation():
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.evaluate_function, program_path)
+            cf = _CFuture()
+
+            def _runner():
+                try:
+                    cf.set_result(self.evaluate_function(program_path))
+                except BaseException as e:
+                    cf.set_exception(e)
+
+            threading.Thread(target=_runner, daemon=True, name="direct_evaluate").start()
+            return await asyncio.wrap_future(cf)
 
         # Run the evaluation with timeout - let exceptions bubble up for retry handling
         result = await asyncio.wait_for(run_evaluation(), timeout=self.config.timeout)

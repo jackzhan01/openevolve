@@ -60,13 +60,10 @@ prompt:
     math.  Prefer Triton kernels for core forward/backward work.
 
     Hardware feedback:
-    When a candidate becomes the new best, the evaluator profiles it with
-    Nsight Compute. If any hardware problems are detected, a "hardware_warnings"
-    artifact appears listing the issues. Each warning names a specific bottleneck
-    and the general fix -- take it seriously and address it in your next mutation.
-    No artifact means the hardware profile is clean.
-    Penalized patterns also reduce the combined_score directly, so fixing them
-    improves both the score and the hardware health of the kernel.
+    Every correct candidate is profiled with Nsight Compute.
+    Hardware metrics are collected for telemetry but do NOT affect the score or this prompt.
+    A separate NCU optimization pass may silently improve a candidate's kernel between
+    iterations — if it scores higher, it replaces the original transparently.
 
 database:
   population_size: 30
@@ -83,3 +80,7 @@ evaluator:
 
 diff_based_evolution: true
 max_code_length: 30000
+
+# NCU silent optimizer pass
+ncu_enable: false   # set true to activate the LLM optimizer pass
+ncu_freq: 10        # run optimizer every N iterations

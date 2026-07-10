@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,7 @@ class ProfileResult:
     kernels: list[KernelProfile] = field(default_factory=list)
     aggregate: dict[str, Any] = field(default_factory=dict)
     top_rule: dict[str, Any] | None = None
+    report_path: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -120,6 +122,7 @@ class ProfileResult:
             "error": self.error,
             "aggregate": self.aggregate,
             "top_rule": self.top_rule,
+            "report_path": self.report_path,
             "kernels": [
                 {"name": k.name, "duration_ns": k.duration_ns, "metrics": k.metrics, "top_rule": k.top_rule}
                 for k in self.kernels
@@ -348,6 +351,17 @@ def run_ncu_profile(
                     KernelProfile(name=action.name(), duration_ns=duration, metrics=kmetrics, top_rule=top_rule)
                 )
 
+        # Copy the report out before the TemporaryDirectory is deleted.
+        persistent_report_path: str | None = None
+        if kernels:
+            try:
+                fd, persistent_path = tempfile.mkstemp(suffix=".ncu-rep", prefix="ncu_saved_")
+                os.close(fd)
+                shutil.copy2(str(report_path), persistent_path)
+                persistent_report_path = persistent_path
+            except Exception:
+                pass  # optimizer will fall back to pre-extracted metrics
+
     if not kernels:
         return ProfileResult(ok=False, error="ncu produced no kernel actions")
 
@@ -383,7 +397,7 @@ def run_ncu_profile(
         ):
             overall_top_rule = k.top_rule
 
-    return ProfileResult(ok=True, kernels=kernels, aggregate=aggregate, top_rule=overall_top_rule)
+    return ProfileResult(ok=True, kernels=kernels, aggregate=aggregate, top_rule=overall_top_rule, report_path=persistent_report_path)
 
 
 def derive_flags(aggregate: dict[str, Any]) -> dict[str, Any]:
