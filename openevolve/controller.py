@@ -192,6 +192,8 @@ class OpenEvolve:
         """Set up logging"""
         log_dir = self.config.log_dir or os.path.join(self.output_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
+        # Persist resolved path so worker processes can attach their own file handler
+        self.config.log_dir = log_dir
 
         # Set up root logger
         root_logger = logging.getLogger()
@@ -291,6 +293,12 @@ class OpenEvolve:
             initial_metrics = await self.evaluator.evaluate_program(
                 self.initial_program_code, initial_program_id
             )
+
+            # Firewall: ncu_* metrics feed only the NCU optimizer pass and must never
+            # enter the database — parent metrics are rendered into evolver prompts.
+            initial_metrics = {
+                k: v for k, v in initial_metrics.items() if not k.startswith("ncu_")
+            }
 
             initial_program = Program(
                 id=initial_program_id,

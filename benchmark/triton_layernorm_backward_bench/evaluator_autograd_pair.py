@@ -216,7 +216,11 @@ def _pair_outputs(forward_fn: Callable, backward_fn: Callable, dy, x, weight, bi
 
 
 def _case_report(case) -> dict[str, Any]:
-    return dict(task_spec.case_metadata(case)) if hasattr(task_spec, "case_metadata") else {"case": repr(case)}
+    return (
+        dict(task_spec.case_metadata(case))
+        if hasattr(task_spec, "case_metadata")
+        else {"case": repr(case)}
+    )
 
 
 def _run_correctness(forward_fn: Callable, backward_fn: Callable, cases):
@@ -237,7 +241,11 @@ def _run_correctness(forward_fn: Callable, backward_fn: Callable, cases):
                 saved_tensors = _normalize_saved(saved)
             report["forward_shape"] = list(y.shape)
             report["saved_tensors"] = [
-                {"shape": list(t.shape), "dtype": str(t.dtype), "bytes": t.numel() * t.element_size()}
+                {
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype),
+                    "bytes": t.numel() * t.element_size(),
+                }
                 for t in saved_tensors
             ]
             report["saved_bytes"] = _saved_bytes(saved_tensors)
@@ -249,7 +257,14 @@ def _run_correctness(forward_fn: Callable, backward_fn: Callable, cases):
                     max_abs = max_rel = float("inf")
                 else:
                     max_abs, max_rel = _max_errors(got, ref)
-                    ok = bool(torch.allclose(got, ref, atol=task_spec.atol(case, name), rtol=task_spec.rtol(case, name)))
+                    ok = bool(
+                        torch.allclose(
+                            got,
+                            ref,
+                            atol=task_spec.atol(case, name),
+                            rtol=task_spec.rtol(case, name),
+                        )
+                    )
                 report[f"{name}_correct"] = ok
                 report[f"{name}_max_abs_error"] = max_abs
                 report[f"{name}_max_rel_error"] = max_rel
@@ -273,7 +288,9 @@ def _run_correctness(forward_fn: Callable, backward_fn: Callable, cases):
         "passed": passed,
         "total": len(cases),
         "partial_correctness": passed / total,
-        **{f"{name}_correctness": passed_by_output[name] / total for name in task_spec.OUTPUT_NAMES},
+        **{
+            f"{name}_correctness": passed_by_output[name] / total for name in task_spec.OUTPUT_NAMES
+        },
         "reports": reports,
     }
 
@@ -600,7 +617,12 @@ def evaluate(program_path: str) -> EvaluationResult:
     if not torch.cuda.is_available():
         return _result(
             {"combined_score": -1e9, "correct": 0.0},
-            {"failure": {"error_type": "RuntimeUnavailable", "error_message": "CUDA is not available"}},
+            {
+                "failure": {
+                    "error_type": "RuntimeUnavailable",
+                    "error_message": "CUDA is not available",
+                }
+            },
         )
     try:
         module = _load_module(program_path)
@@ -608,7 +630,13 @@ def evaluate(program_path: str) -> EvaluationResult:
     except Exception as exc:
         return _result(
             {"combined_score": -1e9, "correct": 0.0},
-            {"failure": {"error_type": "ImportOrApiError", "error_message": str(exc), "traceback": traceback.format_exc(limit=8)}},
+            {
+                "failure": {
+                    "error_type": "ImportOrApiError",
+                    "error_message": str(exc),
+                    "traceback": traceback.format_exc(limit=8),
+                }
+            },
         )
 
     correctness = None

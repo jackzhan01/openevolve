@@ -430,6 +430,11 @@ class Config:
     # Parallel controller settings
     max_tasks_per_child: Optional[int] = None
 
+    # NCU-guided optimization (silent post-evaluation pass; evolver never sees NCU data)
+    ncu_enable: bool = False
+    ncu_freq: int = 10          # Run the NCU pass every N iterations
+    ncu_optimizer_timeout: int = 180  # Wall-clock cap (s) for the NCU optimizer LLM call
+
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "Config":
         """Load configuration from a YAML file"""

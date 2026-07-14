@@ -20,7 +20,6 @@ from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class SerializableResult:
     """Result that can be pickled and sent between processes"""
@@ -44,11 +43,26 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     if parent_env:
         os.environ.update(parent_env)
 
+    # Worker processes are spawned fresh and have NO logging handlers — without this,
+    # every log line inside the worker (evaluation, NCU pass, etc.) is silently dropped.
+    log_dir = config_dict.get("log_dir")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, config_dict.get("log_level", "INFO"), logging.INFO))
+    if log_dir and not any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
+        worker_log_path = Path(log_dir) / "workers.log"
+        handler = logging.FileHandler(worker_log_path, mode="a")
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - PID %(process)d - %(name)s - %(levelname)s - %(message)s")
+        )
+        root_logger.addHandler(handler)
+        logger.info(f"Worker logging initialized → {worker_log_path}")
+
     global _worker_config
     global _worker_evaluation_file
     global _worker_evaluator
     global _worker_llm_ensemble
     global _worker_prompt_sampler
+    global _worker_ncu_optimizer
 
     # Store config for later use
     # Reconstruct Config object from nested dictionaries
@@ -93,6 +107,7 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     _worker_evaluator = None
     _worker_llm_ensemble = None
     _worker_prompt_sampler = None
+    _worker_ncu_optimizer = None
 
 
 def _lazy_init_worker_components():
@@ -100,6 +115,7 @@ def _lazy_init_worker_components():
     global _worker_evaluator
     global _worker_llm_ensemble
     global _worker_prompt_sampler
+    global _worker_ncu_optimizer
 
     if _worker_llm_ensemble is None:
         from openevolve.llm.ensemble import LLMEnsemble
@@ -129,6 +145,11 @@ def _lazy_init_worker_components():
             database=None,  # No shared database in worker
             suffix=getattr(_worker_config, "file_suffix", ".py"),
         )
+
+    if _worker_ncu_optimizer is None and getattr(_worker_config, "ncu_enable", False):
+        from openevolve.ncu_optimizer import NCUOptimizer
+
+        _worker_ncu_optimizer = NCUOptimizer(llm_ensemble=_worker_llm_ensemble)
 
 
 def _run_iteration_worker(
@@ -289,20 +310,131 @@ def _run_iteration_worker(
         import uuid
 
         child_id = str(uuid.uuid4())
-        child_metrics = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
+        _t_eval = time.time()
+        logger.info(f"[iter {iteration}] evaluating child program ...")
+        child_metrics_raw = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
+        logger.info(f"[iter {iteration}] evaluation done in {time.time()-_t_eval:.1f}s (correct={child_metrics_raw.get('correct', 0):.0f})")
 
-        # Get artifacts
+        # Separate NCU metrics from evolution metrics.
+        # ncu_* keys are NEVER stored in the database — the evolver never sees them.
+        ncu_metrics = {k: v for k, v in child_metrics_raw.items() if k.startswith("ncu_")}
+        child_metrics = {k: v for k, v in child_metrics_raw.items() if not k.startswith("ncu_")}
+
+        logger.info(
+            f"[iter {iteration}] ncu metrics collected: {list(ncu_metrics.keys()) or 'none'}"
+        )
+
+        # Get artifacts (may include ncu_report_path if evaluator wrote one)
         artifacts = _worker_evaluator.get_pending_artifacts(child_id)
+        ncu_report_path: Optional[str] = (artifacts or {}).get("ncu_report_path")
+        logger.info(f"[iter {iteration}] ncu_report_path={'set' if ncu_report_path else 'not set'}")
 
-        # Create child program
+        final_code = child_code
+        final_metrics = child_metrics
+
+        # ------------------------------------------------------------------ #
+        # Code archive — save every iteration's generated code to disk so it  #
+        # can be inspected offline.  Layout (sibling of logs/):               #
+        #   <output_dir>/programs/iter_0001.py                                #
+        #   <output_dir>/programs/iter_0003_ncu_original.py  (NCU freq hit)   #
+        #   <output_dir>/programs/iter_0003_ncu_improved.py  (if improved)    #
+        # ------------------------------------------------------------------ #
+        _programs_dir: Optional[Path] = None
+        if getattr(_worker_config, "log_dir", None):
+            _programs_dir = Path(_worker_config.log_dir).parent / "programs"
+            try:
+                _programs_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                _programs_dir = None
+
+        def _save_code(code: str, suffix: str) -> None:
+            if _programs_dir is None:
+                return
+            path = _programs_dir / f"iter_{iteration:04d}{suffix}.py"
+            try:
+                path.write_text(code, encoding="utf-8")
+            except Exception as exc:
+                logger.warning(f"[iter {iteration}] failed to save code to {path}: {exc}")
+
+        # NCU silent optimization pass — runs independently of the evolver
+        ncu_freq = getattr(_worker_config, "ncu_freq", 10)
+        ncu_pass_conditions = {
+            "ncu_enable": getattr(_worker_config, "ncu_enable", False),
+            "optimizer_ready": _worker_ncu_optimizer is not None,
+            "freq_hit": ncu_freq > 0 and iteration % ncu_freq == 0,
+            "has_ncu_metrics": bool(ncu_metrics),
+            "correct": child_metrics.get("correct", 0) > 0,
+        }
+        logger.info(f"[iter {iteration}] NCU pass gate: {ncu_pass_conditions}")
+
+        if all(ncu_pass_conditions.values()):
+            logger.info(f"[iter {iteration}] NCU optimization pass — calling LLM ...")
+            logger.debug("NCU optimizer — original code\n=== ORIGINAL CODE ===\n%s", child_code)
+            _save_code(child_code, "_ncu_original")
+            ncu_optimizer_timeout = getattr(_worker_config, "ncu_optimizer_timeout", 180)
+
+            async def _ncu_optimize_with_timeout():
+                return await asyncio.wait_for(
+                    _worker_ncu_optimizer.optimize(child_code, ncu_metrics, ncu_report_path),
+                    timeout=ncu_optimizer_timeout,
+                )
+
+            try:
+                optimized_code = asyncio.run(_ncu_optimize_with_timeout())
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[iter {iteration}] NCU optimizer LLM call timed out after {ncu_optimizer_timeout}s — skipping pass"
+                )
+                optimized_code = None
+            if optimized_code:
+                logger.info(f"[iter {iteration}] NCU: LLM returned optimized code ({len(optimized_code)} chars) — re-evaluating ...")
+                logger.debug("NCU optimizer — generated code\n=== OPTIMIZED CODE ===\n%s", optimized_code)
+                opt_id = str(uuid.uuid4())
+                _t_reeval = time.time()
+                opt_metrics_raw = asyncio.run(_worker_evaluator.evaluate_program(optimized_code, opt_id))
+                logger.info(
+                    f"[iter {iteration}] NCU: re-evaluation done in {time.time()-_t_reeval:.1f}s "
+                    f"(correct={opt_metrics_raw.get('correct', 0):.0f})"
+                )
+                opt_metrics = {k: v for k, v in opt_metrics_raw.items() if not k.startswith("ncu_")}
+
+                orig_score = child_metrics.get("combined_score", safe_numeric_average(child_metrics))
+                opt_score = opt_metrics.get("combined_score", safe_numeric_average(opt_metrics))
+
+                if (
+                    isinstance(opt_score, (int, float))
+                    and isinstance(orig_score, (int, float))
+                    and opt_score > orig_score
+                ):
+                    logger.info(
+                        f"[iter {iteration}] NCU optimizer improved score "
+                        f"{orig_score:.4f} → {opt_score:.4f} (Δ={opt_score - orig_score:+.4f}); replacing child silently"
+                    )
+                    _save_code(optimized_code, "_ncu_improved")
+                    final_code = optimized_code
+                    final_metrics = opt_metrics
+                    # Swap artifacts to the optimized program's artifacts
+                    artifacts = _worker_evaluator.get_pending_artifacts(opt_id)
+                else:
+                    logger.info(
+                        f"[iter {iteration}] NCU optimizer did not improve: "
+                        f"original={orig_score:.4f} optimized={opt_score:.4f}; keeping original"
+                    )
+            else:
+                logger.info(f"[iter {iteration}] NCU optimizer returned no change")
+
+        # Save the final iteration code (post-NCU-pass if applicable)
+        _save_code(final_code, "")
+
+        # Create child program (clean metrics — no ncu_* keys)
         child_program = Program(
             id=child_id,
-            code=child_code,
+            code=final_code,
             changes_description=child_changes_desc,
             language=_worker_config.language,
             parent_id=parent.id,
             generation=parent.generation + 1,
-            metrics=child_metrics,
+            metrics=final_metrics,
             iteration_found=iteration,
             metadata={
                 "changes": changes_summary,
@@ -312,6 +444,12 @@ def _run_iteration_worker(
         )
 
         iteration_time = time.time() - iteration_start
+
+        # Firewall: no ncu_* artifact (report path, profile errors, ...) may reach the
+        # database — artifacts are rendered into future prompts, and the evolver must
+        # not see NCU data.
+        if artifacts:
+            artifacts = {k: v for k, v in artifacts.items() if not k.startswith("ncu_")}
 
         # Get target island from snapshot (where child should be placed)
         target_island = db_snapshot.get("sampling_island")
@@ -391,6 +529,9 @@ class ProcessParallelController:
             "max_code_length": config.max_code_length,
             "language": config.language,
             "file_suffix": self.file_suffix,
+            "ncu_enable": config.ncu_enable,
+            "ncu_freq": config.ncu_freq,
+            "ncu_optimizer_timeout": config.ncu_optimizer_timeout,
         }
 
     def start(self) -> None:
@@ -489,12 +630,23 @@ class ProcessParallelController:
 
         # Track pending futures by island to maintain distribution
         pending_futures: Dict[int, Future] = {}
+        future_submit_times: Dict[int, float] = {}  # wall-clock submit time per iteration
         island_pending: Dict[int, List[int]] = {i: [] for i in range(self.num_islands)}
         batch_size = min(self.num_workers * 2, max_iterations)
 
         # Submit initial batch - distribute across islands
         batch_per_island = max(1, batch_size // self.num_islands) if batch_size > 0 else 0
         current_iteration = start_iteration
+
+        # Wall-clock timeout per future: normal eval budget + NCU extra if enabled
+        ncu_extra = 0
+        if getattr(self.config, "ncu_enable", False):
+            ncu_extra = (
+                self.config.llm.timeout
+                + self.config.evaluator.timeout
+                + getattr(self.config, "ncu_optimizer_timeout", 90)
+            )
+        timeout_seconds = self.config.evaluator.timeout + 30 + ncu_extra
 
         # Round-robin distribution across islands
         for island_id in range(self.num_islands):
@@ -503,6 +655,7 @@ class ProcessParallelController:
                     future = self._submit_iteration(current_iteration, island_id)
                     if future:
                         pending_futures[current_iteration] = future
+                        future_submit_times[current_iteration] = time.time()
                         island_pending[island_id].append(current_iteration)
                     current_iteration += 1
 
@@ -542,16 +695,47 @@ class ProcessParallelController:
                     break
 
             if completed_iteration is None:
+                # Cancel any worker that has exceeded the wall-clock budget
+                now = time.time()
+                for iter_id, future in list(pending_futures.items()):
+                    elapsed = now - future_submit_times.get(iter_id, now)
+                    if elapsed > timeout_seconds:
+                        logger.error(
+                            f"⏰ Iteration {iter_id} worker exceeded wall-clock timeout of "
+                            f"{timeout_seconds:.0f}s ({elapsed:.0f}s elapsed) — canceling"
+                        )
+                        future.cancel()
+                        pending_futures.pop(iter_id)
+                        future_submit_times.pop(iter_id, None)
+                        for isl_id, ilist in island_pending.items():
+                            if iter_id in ilist:
+                                ilist.remove(iter_id)
+                                break
+                        completed_iterations += 1
+                        # Submit a replacement iteration
+                        for isl_id in range(self.num_islands):
+                            if (
+                                len(island_pending[isl_id]) < batch_per_island
+                                and next_iteration < total_iterations
+                                and not self.shutdown_event.is_set()
+                            ):
+                                nf = self._submit_iteration(next_iteration, isl_id)
+                                if nf:
+                                    pending_futures[next_iteration] = nf
+                                    future_submit_times[next_iteration] = time.time()
+                                    island_pending[isl_id].append(next_iteration)
+                                    next_iteration += 1
+                                break
+                        break  # one cancellation per poll cycle
                 await asyncio.sleep(0.01)
                 continue
 
             # Process completed result
             future = pending_futures.pop(completed_iteration)
+            future_submit_times.pop(completed_iteration, None)
 
             try:
-                # Use evaluator timeout + buffer to gracefully handle stuck processes
-                timeout_seconds = self.config.evaluator.timeout + 30
-                result = future.result(timeout=timeout_seconds)
+                result = future.result(timeout=5)  # future is already done; short drain timeout
 
                 if result.error:
                     logger.warning(f"Iteration {completed_iteration} error: {result.error}")
@@ -773,6 +957,7 @@ class ProcessParallelController:
                     future = self._submit_iteration(next_iteration, island_id)
                     if future:
                         pending_futures[next_iteration] = future
+                        future_submit_times[next_iteration] = time.time()
                         island_pending[island_id].append(next_iteration)
                         next_iteration += 1
                         break  # Only submit one iteration per completion to maintain balance
