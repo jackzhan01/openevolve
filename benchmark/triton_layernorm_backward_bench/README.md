@@ -195,6 +195,108 @@ permission is denied, profiling fails into an `ncu_profile_error` artifact and
 scoring falls back to the unmodified timing-based result -- it never blocks or
 crashes the evolutionary loop.
 
+## Autograd-Pair Shape-Aware Evaluation
+
+The autograd-pair evaluator uses the public API:
+
+```python
+def layernorm_forward_with_saved(x, weight, bias, eps=1e-5):
+    return y, saved_tensors
+
+def layernorm_backward_from_saved(dy, saved_tensors, eps=1e-5):
+    return dx, dweight, dbias
+```
+
+The base evaluator is `evaluator_autograd_pair.py`. Thin wrappers select the
+score mode through environment variables:
+
+```text
+evaluator_autograd_pair_speed_memory.py
+  score = (0.5 * backward_speedup + 0.5 * full_step_speedup)
+          / (1 + 0.05 * saved_memory_ratio)
+
+evaluator_autograd_pair_speed_memory_min.py
+  score = min(backward_speedup, full_step_speedup)
+          / (1 + 0.05 * saved_memory_ratio)
+
+evaluator_autograd_pair_speed_memory_min_geomean.py
+  score = min(geomean(backward_speedup_per_case),
+              geomean(full_step_speedup_per_case))
+          / (1 + 0.05 * saved_memory_ratio)
+
+evaluator_autograd_pair_speed_memory_min_weighted_geomean.py
+  per_case_score_i = min(backward_speedup_i, full_step_speedup_i)
+  weighted_geomean = exp(sum_i w_i * log(per_case_score_i) / sum_i w_i)
+  worst_case_guard = min(1, min_i per_case_score_i)
+  score = weighted_geomean * worst_case_guard
+          / (1 + 0.05 * saved_memory_ratio)
+```
+
+`backward_speedup` is measured from `layernorm_backward_from_saved` after the
+forward saved tensors have already been prepared. `full_step_speedup` uses an
+aligned raw forward+backward comparison:
+
+```text
+candidate: y, saved = layernorm_forward_with_saved(...);
+           layernorm_backward_from_saved(dy, saved, eps)
+
+Liger:     layer_norm_forward(...);
+           layer_norm_backward(dy, x, weight, bias, mean, rstd)
+```
+
+The older autograd-wrapper full step is still reported as
+`autograd_forward_backward_full_step_ms`, but it is not the default score input.
+
+The evaluator supports several environment variables:
+
+```text
+AUTOGRAD_PAIR_PERF_BASELINE=pytorch_autograd|liger
+AUTOGRAD_PAIR_GEOMEAN_WEIGHTS=comma,separated,positive,weights
+AUTOGRAD_PAIR_WORST_CASE_GUARD=1|0
+
+LAYERNORM_BENCHMARK_SUITE=<suite name>
+LAYERNORM_BENCHMARK_DTYPES=float32,float16,bfloat16
+LAYERNORM_BENCHMARK_WARMUP=<int>
+LAYERNORM_BENCHMARK_REPS=<int>
+```
+
+TritonBench-style shape suites are defined in `task_spec.py`:
+
+```text
+tb_small:  i=12..16, shapes (4,1024) through (64,1024)
+tb_medium: i=17..22, shapes (128,1024) through (4096,1024)
+tb_large:  i=23..27, shapes (8192,1024) through (131072,1024)
+tb_mixed:  i=12,14,16,18,20,22,24,26,27
+tb_sweep:  i=12..27
+tb_i12 ... tb_i27: one shape per suite
+```
+
+For weighted-geomean regime-specialized evolution, the shape weights used in
+the LayerNorm study were:
+
+```text
+small weights:  8,4,2,1,1
+medium weights: 1,2,4,4,2,1
+large weights:  1,1,2,4,8
+```
+
+Example large-regime weighted-geomean run:
+
+```bash
+AUTOGRAD_PAIR_PERF_BASELINE=liger \
+AUTOGRAD_PAIR_GEOMEAN_WEIGHTS=1,1,2,4,8 \
+LAYERNORM_BENCHMARK_SUITE=tb_large \
+LAYERNORM_BENCHMARK_DTYPES=float32 \
+LAYERNORM_BENCHMARK_WARMUP=3 \
+LAYERNORM_BENCHMARK_REPS=10 \
+openevolve-run \
+  /path/to/initial_program_autograd_pair.py \
+  benchmark/triton_layernorm_backward_bench/evaluator_autograd_pair_speed_memory_min_weighted_geomean.py \
+  --config benchmark/triton_layernorm_backward_bench/config_autograd_pair_speed_memory_min_weighted_geomean.yaml \
+  --iterations 10 \
+  --output /tmp/openevolve_layernorm_tb_large_weighted_geomean
+```
+
 ## Strong Baseline Check
 
 After an OpenEvolve run:

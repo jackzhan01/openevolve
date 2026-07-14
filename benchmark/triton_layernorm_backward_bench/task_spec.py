@@ -31,7 +31,7 @@ CORRECTNESS_CASES = [
 ]
 
 # Aligned with tests/atenir_correctness/run_correctness.py SHAPE_PRESETS["layernorm"].
-_ALL_BENCHMARK_SHAPES = [
+_LAYERNORM_BENCHMARK_SHAPES_MIXED = [
     # dynamic
     (1, 768),
     (8, 1024),
@@ -60,25 +60,112 @@ _LARGE_BENCHMARK_SHAPES = [
     (64, 8192),
 ]
 
-# AUTOGRAD_PAIR_SHAPE_PROFILE selects which shape suite drives BENCHMARK_CASES
-# (and therefore combined_score during OpenEvolve). Default "all" preserves the
-# original unified dynamic + nontile suite. CORRECTNESS_CASES is untouched by
-# this switch on purpose -- it stays the hard pass/fail gate regardless of the
-# shape profile used for performance scoring.
-_SHAPE_PROFILE = os.environ.get("AUTOGRAD_PAIR_SHAPE_PROFILE", "all")
-_LAYERNORM_BENCHMARK_SHAPES = {
-    "all": _ALL_BENCHMARK_SHAPES,
-    "small": _SMALL_BENCHMARK_SHAPES,
-    "large": _LARGE_BENCHMARK_SHAPES,
-}[_SHAPE_PROFILE]
+_LAYERNORM_BENCHMARK_SHAPES_SMALL = [
+    (1, 768),
+    (8, 1024),
+    (17, 127),
+    (17, 513),
+    (17, 1000),
+]
+
+_LAYERNORM_BENCHMARK_SHAPES_LARGE = [
+    (1024, 1024),
+    (4096, 1024),
+    (16384, 1024),
+    (65536, 1024),
+    (131072, 1024),
+]
+
+
+def _tritonbench_layernorm_shape(i: int) -> tuple[int, int]:
+    size = 2**i
+    return size // 1024, 1024
+
+
+_LAYERNORM_BENCHMARK_SHAPES_TB_SWEEP = [
+    _tritonbench_layernorm_shape(i)
+    for i in range(12, 28)
+]
+
+_LAYERNORM_BENCHMARK_SHAPES_TB_SMALL = [
+    _tritonbench_layernorm_shape(i)
+    for i in range(12, 17)
+]
+
+_LAYERNORM_BENCHMARK_SHAPES_TB_MEDIUM = [
+    _tritonbench_layernorm_shape(i)
+    for i in range(17, 23)
+]
+
+_LAYERNORM_BENCHMARK_SHAPES_TB_LARGE = [
+    _tritonbench_layernorm_shape(i)
+    for i in range(23, 28)
+]
+
+_LAYERNORM_BENCHMARK_SHAPES_TB_MIXED = [
+    _tritonbench_layernorm_shape(i)
+    for i in (12, 14, 16, 18, 20, 22, 24, 26, 27)
+]
+
+_LAYERNORM_BENCHMARK_SHAPE_SUITES = {
+    "mixed": _LAYERNORM_BENCHMARK_SHAPES_MIXED,
+    "all": _LAYERNORM_BENCHMARK_SHAPES_MIXED,
+    "small": _LAYERNORM_BENCHMARK_SHAPES_SMALL,
+    "large": _LAYERNORM_BENCHMARK_SHAPES_LARGE,
+    "legacy_small": _SMALL_BENCHMARK_SHAPES,
+    "legacy_large": _LARGE_BENCHMARK_SHAPES,
+    "tb_small": _LAYERNORM_BENCHMARK_SHAPES_TB_SMALL,
+    "tb_medium": _LAYERNORM_BENCHMARK_SHAPES_TB_MEDIUM,
+    "tb_large": _LAYERNORM_BENCHMARK_SHAPES_TB_LARGE,
+    "tb_mixed": _LAYERNORM_BENCHMARK_SHAPES_TB_MIXED,
+    "tb_sweep": _LAYERNORM_BENCHMARK_SHAPES_TB_SWEEP,
+    **{
+        f"tb_i{i}": [_tritonbench_layernorm_shape(i)]
+        for i in range(12, 28)
+    },
+}
+
+_BENCHMARK_DTYPE_TOLERANCES = {
+    "float32": (2e-5, 2e-5),
+    "float16": (5e-2, 5e-2),
+    "bfloat16": (8e-2, 8e-2),
+}
+
+
+def benchmark_suite_name() -> str:
+    suite = os.environ.get(
+        "LAYERNORM_BENCHMARK_SUITE",
+        os.environ.get("AUTOGRAD_PAIR_SHAPE_PROFILE", "mixed"),
+    ).strip().lower()
+    if suite not in _LAYERNORM_BENCHMARK_SHAPE_SUITES:
+        valid = ", ".join(sorted(_LAYERNORM_BENCHMARK_SHAPE_SUITES))
+        raise ValueError(f"Unsupported LAYERNORM_BENCHMARK_SUITE={suite!r}; expected one of: {valid}")
+    return suite
+
+
+def benchmark_shapes() -> list[tuple[int, int]]:
+    return list(_LAYERNORM_BENCHMARK_SHAPE_SUITES[benchmark_suite_name()])
+
+
+def benchmark_dtype_names() -> list[str]:
+    raw = os.environ.get("LAYERNORM_BENCHMARK_DTYPES", "float32,float16,bfloat16")
+    aliases = {"bf16": "bfloat16", "fp32": "float32", "fp16": "float16"}
+    dtypes = [aliases.get(part.strip().lower(), part.strip().lower()) for part in raw.split(",") if part.strip()]
+    if not dtypes:
+        raise ValueError("LAYERNORM_BENCHMARK_DTYPES must include at least one dtype")
+    invalid = [dtype for dtype in dtypes if dtype not in _BENCHMARK_DTYPE_TOLERANCES]
+    if invalid:
+        valid = ", ".join(sorted(_BENCHMARK_DTYPE_TOLERANCES))
+        raise ValueError(f"Unsupported LAYERNORM_BENCHMARK_DTYPES values {invalid!r}; expected any of: {valid}")
+    return dtypes
 
 
 def _make_benchmark_cases() -> list[TestCase]:
     cases: list[TestCase] = []
-    for rows, cols in _LAYERNORM_BENCHMARK_SHAPES:
-        cases.append(TestCase(rows, cols, "float32", 2e-5, 2e-5))
-        cases.append(TestCase(rows, cols, "float16", 5e-2, 5e-2))
-        cases.append(TestCase(rows, cols, "bfloat16", 8e-2, 8e-2))
+    for rows, cols in benchmark_shapes():
+        for dtype_name in benchmark_dtype_names():
+            atol_value, rtol_value = _BENCHMARK_DTYPE_TOLERANCES[dtype_name]
+            cases.append(TestCase(rows, cols, dtype_name, atol_value, rtol_value))
     return cases
 
 
