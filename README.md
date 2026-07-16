@@ -17,18 +17,32 @@ tests/atenir_correctness/          # Unified correctness harness and regression 
 
 The whole pipeline is packaged behind a single interface: give it **one PyTorch forward in a file**
 and it returns a shape-dispatched fused **forward+backward** kernel and a **performance report** vs a
-strong baseline (Liger where one exists), printing each stage and its live progress as it runs.
+strong baseline (PyTorch autograd, or Liger for the ops it covers), printing each stage's live
+progress as it runs. It assumes it is already on a GPU — allocating the node / setting up the env is
+the caller's concern, never the pipeline's.
 
 ```bash
-python -m pipeline.case_harness_agent.autodiff --forward my_rmsnorm.py --op rmsnorm
-# on this Slurm cluster, wrap it with the (local, non-product) node+env launcher:
-export OPENAI_API_KEY=sk-...
-bash bootstrap.sh --forward my_rmsnorm.py --op rmsnorm --iterations 10 --gpus 3
+# needs a GPU and OPENAI_API_KEY; here the forward is an existing reference file in the repo
+python -m pipeline.case_harness_agent.autodiff \
+  --forward benchmark/triton_layernorm_backward_bench/forward_ref.py:layernorm_forward_ref \
+  --op layernorm --bench-dir benchmark/triton_layernorm_auto_backward_bench \
+  --iterations 10 --gpus 3
 ```
 
-It runs `taskspec → prep → seed → evolve → dispatch → report`, with every gate's notion of
-"correct" kept independent of the LLM that wrote the code. Full interface docs — stages, file map,
-baseline handling, `--gpus 1|3`, progress — are in
+From the forward alone it runs five stages, with every gate's notion of "correct" kept independent
+of the LLM that wrote the code:
+
+- **taskspec** — one LLM call turns the forward into a benchmark spec (input semantics, which args
+  are differentiable, the backward's reduction axis → shape regime, benchmark shapes); the contract
+  and correctness oracles are derived in code, not by the LLM.
+- **seed** — the fusion agent writes the first *correct* fused backward kernel.
+- **evolve** — OpenEvolve evolves a generalist plus small/large shape-regime specialists,
+  sequentially on one GPU (`--gpus 1`) or one group per GPU (`--gpus 3`).
+- **dispatch** — measures every program across the full shape grid, picks the regime threshold, and
+  emits the deployed forward+backward.
+- **report** — renders `RESULTS_<op>_vs_<baseline>.md`.
+
+Full interface docs — file map, baseline handling, `--gpus 1|3`, live progress — are in
 [`pipeline/case_harness_agent/README.md`](pipeline/case_harness_agent/README.md).
 
 ## Benchmark

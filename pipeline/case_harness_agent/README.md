@@ -21,20 +21,24 @@ Shell form:
 python -m pipeline.case_harness_agent.autodiff --forward my_rmsnorm.py --op rmsnorm
 ```
 
-## What it does — the six stages
+## What it does — the stages
 
 ```
-taskspec → prep → seed → evolve → dispatch → report
+taskspec → seed → evolve → dispatch → report
 ```
 
 | stage | what happens | truth is checked by |
 | --- | --- | --- |
 | **taskspec** | one LLM call turns the forward into a benchmark spec (input semantics, differentiable args, math, the backward's reduction axis → shape regime, benchmark shapes). Contract + oracles + tolerances are **code-derived, never trusted from the LLM**. | self-check: a trivial `forward + autograd` pair must score `correct == 1.0` in the real evaluator |
-| **prep** | scaffold evaluators/configs; if the baseline is Liger, synthesize `strong_baselines/liger_<op>.py` (**zero-shot** — no example wrapper) | `verify_liger_baseline.py`: wrapped forward + every gradient vs the PyTorch oracle |
-| **seed** | the fusion agent writes the first fused backward kernel | correctness vs the code-derived oracle |
+| **seed** | the fusion agent writes the first *correct* fused backward kernel | correctness vs the code-derived oracle |
 | **evolve** | OpenEvolve evolves three groups: `full` (generalist), `small` / `large` (regime specialists) | the evaluator's correctness gate before any timing |
 | **dispatch** | measure every program on the whole shape grid, pick the real regime threshold, emit the dispatched program | real measurement |
 | **report** | render `RESULTS_<op>_vs_<baseline>.md` | — |
+
+Between taskspec and seed the harness auto-scaffolds the evaluators/configs. Only when the baseline
+is Liger does it also synthesize `strong_baselines/liger_<op>.py` (zero-shot), gated by
+`verify_liger_baseline.py` (wrapped forward + every gradient vs the PyTorch oracle); the general path
+compares against PyTorch autograd and needs no wrapper.
 
 The one invariant that lets this be automated: **every gate's notion of "correct" is independent
 of the LLM call that wrote the code.** taskspec's gate is a code-derived oracle; the wrapper's gate
@@ -51,7 +55,7 @@ pipeline/case_harness_agent/
   orchestrate.py              # the six-stage driver (stage banners, streaming _run, evolve modes)
   synthesize_task_spec.py     # taskspec: forward → spec + code-derived contract/oracles/tolerances
   scaffold.py                 # generates evaluators + configs for a case
-  synthesize_liger_wrapper.py # prep: zero-shot Liger baseline wrapper + closed-loop gate
+  synthesize_liger_wrapper.py # zero-shot Liger baseline wrapper + closed-loop gate (Liger baseline only)
 pipeline/autograd_pair_fusion_agent/   # seed: the fusion agent that writes the first kernel
 pipeline/shared/llm_client.py          # the shared OpenAI-compatible client
 openevolve-run.py                      # evolve
@@ -94,22 +98,13 @@ with `--liger-source` (repeatable). The only trustworthy record of what was meas
   single node with ≥3 visible GPUs. Same three-way parallelism as three nodes, but no cross-node
   scheduling — which fits `autodiff` being one process.
 
-**The pipeline never allocates nodes / calls `srun`.** It assumes it is already on a GPU. Getting
-onto a node (and setting up conda + API key) is the caller's environment concern; on this cluster
-`bootstrap.sh` does it:
-
-```bash
-export OPENAI_API_KEY=sk-...
-bash bootstrap.sh --forward my_rmsnorm.py --op rmsnorm --iterations 10 --gpus 3
-```
-
-`bootstrap.sh` is local scaffolding (Slurm account, conda env, Liger paths are Delta facts) and is
-**not** part of the shippable pipeline.
+**The pipeline never allocates nodes / calls `srun`.** It assumes it is already on a GPU with the
+env and `OPENAI_API_KEY` ready. Getting onto a node and setting that up is the caller's environment
+concern (whatever scheduler they use), deliberately kept out of the pipeline so it stays portable.
 
 ## Watching progress
 
 `orchestrate` prints a timestamped banner per stage and streams each sub-stage's output live. Evolve
 per-iteration progress (`Iteration N … completed in Xs`) streams from OpenEvolve's console handler;
-in `--gpus 3` mode a combined line `[evolve || ] full:iter 4/10  small:iter 6/10  large:iter 3/10`
-is printed every 15s. For a standalone snapshot of a run's evolve progress, `watch_evolve.sh` reads
-OpenEvolve's live per-iteration logs.
+in `--gpus 3` mode a single status line shows all three groups' current iteration plus current/best
+score, updated in place (carriage-return) as they advance.
