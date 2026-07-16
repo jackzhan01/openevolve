@@ -344,11 +344,17 @@ def extract_autograd(fn_spec: str, parsed_inputs, device: str = "cpu") -> fx.Gra
     grad_out = torch.randn_like(sample_out)
 
     def bwd(grad_out, *fwd_inputs):
-        ins = [t.detach().requires_grad_(True) for t in fwd_inputs]
+        # Only floating-point inputs can require grad; non-float index inputs (e.g. an
+        # int64 cross-entropy target) pass through untouched and are not differentiated.
+        ins = [
+            t.detach().requires_grad_(True) if t.is_floating_point() else t.detach()
+            for t in fwd_inputs
+        ]
+        diff_ins = [t for t in ins if t.requires_grad]
         out = forward_fn(*ins)
         if isinstance(out, (tuple, list)):
             out = out[0]
-        return torch.autograd.grad(out, ins, grad_outputs=grad_out)
+        return torch.autograd.grad(out, diff_ins, grad_outputs=grad_out)
 
     return make_fx(bwd, decomposition_table=core_aten_decompositions())(grad_out, *fwd_in)
 

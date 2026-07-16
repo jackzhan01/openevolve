@@ -3,31 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
-from pipeline.autograd_pair_fusion_agent.prompts import LAYERNORM_SPEC, OperatorSpec
 from pipeline.autograd_pair_fusion_agent.synthesize import (
     AutogradPairConfig,
     synthesize_autograd_pair,
 )
-
-
-def _load_op_spec(path: str) -> OperatorSpec:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    no_grad = data.get("no_grad_inputs", [])
-    return OperatorSpec(
-        forward_fn_name=data["forward_fn_name"],
-        forward_args=data["forward_args"],
-        backward_fn_name=data["backward_fn_name"],
-        backward_args=data["backward_args"],
-        backward_returns=data["backward_returns"],
-        forward_semantics=data["forward_semantics"],
-        backward_semantics=data["backward_semantics"],
-        no_grad_inputs=tuple(no_grad),
-        extra_constraints=data.get("extra_constraints", ""),
-    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -39,6 +21,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="AtenIR extraction input spec for the forward reference",
     )
     parser.add_argument("--output-dir", default="autograd_pair_layernorm")
+    parser.add_argument(
+        "--evaluator",
+        default="benchmark/triton_layernorm_backward_bench/evaluator_autograd_pair.py",
+        help="Evaluator used to verify generated autograd-pair programs",
+    )
     parser.add_argument("--api-base", default="https://api.openai.com/v1")
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--api-key", default=None)
@@ -46,32 +33,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=16000)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--eval-timeout", type=int, default=120,
+                        help="kill a candidate kernel eval after this many seconds (guards against "
+                             "a hanging/deadlocked generated kernel)")
     parser.add_argument("--dtype", action="append", default=None)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--lowering-context-file", default=None)
+    parser.add_argument("--pair-api", default=None)
+    parser.add_argument("--pair-api-file", default=None)
+    parser.add_argument("--task-context", default=None)
+    parser.add_argument("--task-context-file", default=None)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
-        "--op-spec",
-        default=None,
-        metavar="JSON_FILE",
-        help=(
-            "Path to a JSON file describing the target operator. "
-            "Required fields: forward_fn_name, forward_args, backward_fn_name, "
-            "backward_args, backward_returns, forward_semantics, backward_semantics. "
-            "Optional fields: no_grad_inputs (list of str), extra_constraints (str). "
-            "Defaults to LayerNorm when omitted."
-        ),
-    )
-    parser.add_argument(
-        "--evaluator",
-        default=None,
-        metavar="EVALUATOR_PATH",
-        help=(
-            "Path to an evaluator script (relative to repo root) used to verify "
-            "generated programs. When omitted, verification is skipped and the "
-            "first generated attempt is saved directly."
-        ),
-    )
     return parser.parse_args(argv)
 
 
@@ -80,12 +52,18 @@ def main(argv: list[str] | None = None) -> int:
     lowering_context = None
     if args.lowering_context_file:
         lowering_context = Path(args.lowering_context_file).read_text(encoding="utf-8")
-    op_spec = _load_op_spec(args.op_spec) if args.op_spec else None
+    pair_api = args.pair_api
+    if args.pair_api_file:
+        pair_api = Path(args.pair_api_file).read_text(encoding="utf-8")
+    task_context = args.task_context
+    if args.task_context_file:
+        task_context = Path(args.task_context_file).read_text(encoding="utf-8")
     return synthesize_autograd_pair(
         AutogradPairConfig(
             forward=args.forward,
             example_input=args.example_input,
             output_dir=Path(args.output_dir).resolve(),
+            evaluator=args.evaluator,
             api_base=args.api_base,
             model=args.model,
             api_key=args.api_key,
@@ -93,12 +71,13 @@ def main(argv: list[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             timeout=args.timeout,
+            eval_timeout=args.eval_timeout,
             dtypes=tuple(args.dtype or ["float32", "float16", "bfloat16"]),
             python=args.python,
             lowering_context=lowering_context,
+            pair_api=pair_api,
+            task_context=task_context,
             dry_run=args.dry_run,
-            op_spec=op_spec,
-            evaluator_path=args.evaluator,
         )
     )
 

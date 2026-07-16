@@ -13,6 +13,24 @@ atenir/                            # AtenIR extraction, graph execution, primiti
 tests/atenir_correctness/          # Unified correctness harness and regression tests
 ```
 
+## `autodiff` — the one-call interface
+
+The whole pipeline is packaged behind a single interface: give it **one PyTorch forward in a file**
+and it returns a shape-dispatched fused **forward+backward** kernel and a **performance report** vs a
+strong baseline (Liger where one exists), printing each stage and its live progress as it runs.
+
+```bash
+python -m pipeline.case_harness_agent.autodiff --forward my_rmsnorm.py --op rmsnorm
+# on this Slurm cluster, wrap it with the (local, non-product) node+env launcher:
+export OPENAI_API_KEY=sk-...
+bash bootstrap.sh --forward my_rmsnorm.py --op rmsnorm --iterations 10 --gpus 3
+```
+
+It runs `taskspec → prep → seed → evolve → dispatch → report`, with every gate's notion of
+"correct" kept independent of the LLM that wrote the code. Full interface docs — stages, file map,
+baseline handling, `--gpus 1|3`, progress — are in
+[`pipeline/case_harness_agent/README.md`](pipeline/case_harness_agent/README.md).
+
 ## Benchmark
 
 `benchmark/` contains public tasks and shared benchmark infrastructure. The

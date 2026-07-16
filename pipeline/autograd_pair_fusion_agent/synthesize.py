@@ -11,9 +11,9 @@ from pathlib import Path
 from pipeline.fusion_agent.graph_summary import summarize_graph_file
 from pipeline.shared.llm_client import generate_with_openai_compatible_api
 from pipeline.autograd_pair_fusion_agent.prompts import (
-    LAYERNORM_SPEC,
+    DEFAULT_PAIR_API,
+    DEFAULT_TASK_CONTEXT,
     SYSTEM_MESSAGE,
-    OperatorSpec,
     render_codegen_prompt,
     render_plan_prompt,
     render_repair_prompt,
@@ -25,6 +25,7 @@ class AutogradPairConfig:
     forward: str
     example_input: str
     output_dir: Path
+    evaluator: str
     api_base: str
     model: str
     api_key: str | None
@@ -34,14 +35,11 @@ class AutogradPairConfig:
     timeout: int
     dtypes: tuple[str, ...]
     python: str
+    eval_timeout: int = 120     # kill a hanging candidate kernel (legit seed eval ~25s, so 120s is ample)
     lowering_context: str | None = None
+    pair_api: str | None = None
+    task_context: str | None = None
     dry_run: bool = False
-    # Operator spec: controls function names/signatures/semantics in prompts.
-    # None defaults to LAYERNORM_SPEC for backward compatibility.
-    op_spec: OperatorSpec | None = None
-    # Path to an evaluator script (relative to repo root) for verification.
-    # None skips verification and accepts the first generated attempt.
-    evaluator_path: str | None = None
 
 
 def _strip_code_fence(text: str) -> str:
@@ -80,21 +78,33 @@ def _extract_graph(config: AutogradPairConfig) -> Path:
 
 
 def _verify_program(config: AutogradPairConfig, program_path: Path) -> dict:
-    if not config.evaluator_path:
-        return {"metrics": {"correct": 1.0}, "verification": "skipped"}
     cmd = [
         config.python,
-        config.evaluator_path,
+        config.evaluator,
         str(program_path),
     ]
-    completed = subprocess.run(
-        cmd,
-        cwd=str(Path(__file__).resolve().parents[2]),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(Path(__file__).resolve().parents[2]),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=config.eval_timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        # An LLM-generated kernel can deadlock / spin on the GPU. Without a timeout the whole
+        # pipeline hangs forever on that one candidate; kill it, mark it failed, and let the next
+        # attempt proceed. (subprocess.run SIGKILLs the child on timeout, freeing its CUDA context.)
+        return {
+            "metrics": {"correct": 0.0},
+            "artifacts": {},
+            "stdout": (e.stdout or "") if isinstance(e.stdout, str) else "",
+            "stderr": f"[eval_timeout] candidate killed after {config.eval_timeout}s "
+                      f"(likely a hanging/deadlocked kernel)",
+            "returncode": -9,
+        }
     try:
         report = json.loads(completed.stdout)
     except json.JSONDecodeError:
@@ -116,7 +126,6 @@ def _passed(report: dict) -> bool:
 
 def synthesize_autograd_pair(config: AutogradPairConfig) -> int:
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    spec = config.op_spec if config.op_spec is not None else LAYERNORM_SPEC
 
     print("Extract: AtenIR reference backward graph")
     graph_path = _extract_graph(config)
@@ -126,12 +135,19 @@ def synthesize_autograd_pair(config: AutogradPairConfig) -> int:
     lowering_context = config.lowering_context or ""
     if lowering_context:
         (config.output_dir / "lowering_context.md").write_text(lowering_context, encoding="utf-8")
+    pair_api = config.pair_api or DEFAULT_PAIR_API
+    task_context = config.task_context or DEFAULT_TASK_CONTEXT
+    if pair_api:
+        (config.output_dir / "pair_api.py").write_text(pair_api, encoding="utf-8")
+    if task_context:
+        (config.output_dir / "task_context.md").write_text(task_context, encoding="utf-8")
 
     plan_prompt = render_plan_prompt(
         forward=config.forward,
         graph_summary=graph_summary,
         lowering_context=lowering_context,
-        spec=spec,
+        pair_api=pair_api,
+        task_context=task_context,
     )
     (config.output_dir / "autograd_pair_plan_prompt.md").write_text(plan_prompt, encoding="utf-8")
 
@@ -143,7 +159,8 @@ def synthesize_autograd_pair(config: AutogradPairConfig) -> int:
                 graph_summary=graph_summary,
                 pair_plan="{AUTOGRAD_PAIR_PLAN_FROM_LLM}",
                 lowering_context=lowering_context,
-                spec=spec,
+                pair_api=pair_api,
+                task_context=task_context,
             ),
             encoding="utf-8",
         )
@@ -167,7 +184,8 @@ def synthesize_autograd_pair(config: AutogradPairConfig) -> int:
         graph_summary=graph_summary,
         pair_plan=pair_plan,
         lowering_context=lowering_context,
-        spec=spec,
+        pair_api=pair_api,
+        task_context=task_context,
     )
     previous_code = ""
     for attempt in range(1, config.max_attempts + 1):
@@ -207,17 +225,14 @@ def synthesize_autograd_pair(config: AutogradPairConfig) -> int:
             print(f"Autograd-pair synthesis passed. Best program: {best_path}")
             return 0
 
-        if not config.evaluator_path:
-            # Verification was skipped but _passed returned False — shouldn't happen.
-            break
-
         repair_prompt = render_repair_prompt(
             graph_summary=graph_summary,
             pair_plan=pair_plan,
             previous_code=code or previous_code,
             verifier_report=json.dumps(report, indent=2, sort_keys=True),
             lowering_context=lowering_context,
-            spec=spec,
+            pair_api=pair_api,
+            task_context=task_context,
         )
         (attempt_dir / "repair_prompt.md").write_text(repair_prompt, encoding="utf-8")
         prompt = repair_prompt
