@@ -1,0 +1,28 @@
+{
+  "bench_dir": "/u/wzhan/openevolve/benchmark/triton_softmax_backward_bench",
+  "regime_split": 16384,
+  "per_program_geomean_full": {
+    "full_r1": 1.696395134249697,
+    "small_r1": 1.5498338293535443,
+    "large_r1": 1.7474648855921195
+  },
+  "per_program_geomean_bwd": {
+    "full_r1": 2.088177765737526,
+    "small_r1": 1.9484028547663828,
+    "large_r1": 2.096886263678808
+  },
+  "failures": {
+    "full_r1": [],
+    "small_r1": [],
+    "large_r1": []
+  },
+  "full_best": "full_r1",
+  "small_best": "small_r1",
+  "large_best": "large_r1",
+  "threshold_dispatch_geomean": 1.8264601786358028,
+  "oracle_geomean": 1.862272391164893,
+  "full_geomean": 1.696395134249697,
+  "best_threshold": 46340.95001184158,
+  "regime_collapsed": false,
+  "final_program": "benchmark/triton_softmax_backward_bench/sm_final_dispatched.py"
+}

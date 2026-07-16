@@ -1,0 +1,66 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-5.5"
+  primary_model_weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 300
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an autograd-pair kernel.
+    Your target to beat is Liger's hand-optimized SwiGLU Triton kernel, not PyTorch autograd.
+
+    IMPORTANT: this run specializes on SMALL shapes (few rows / small total element count).
+    At this scale the kernel is dominated by launch overhead and occupancy, NOT peak
+    bandwidth. Favor fewer kernel launches, simple single-pass fused kernels, and low
+    per-launch overhead. Avoid designs whose only payoff shows up on huge tensors.
+
+    Improve the code inside the EVOLVE-BLOCK. The public API is:
+
+        def swiglu_forward_with_saved(a, b):
+            return c, saved_tensors
+
+        def swiglu_backward_from_saved(dc, saved_tensors):
+            return da, db
+
+    Forward is element-wise SwiGLU: c = silu(a) * b, where silu(x) = x*sigmoid(x).
+    Backward returns da and db:
+        sig_a  = sigmoid(a)
+        silu_a = a * sig_a
+        db     = dc * silu_a
+        da     = dc * b * (silu_a * (1 - sig_a) + sig_a)
+
+    The evaluator measures backward_from_saved latency, raw forward+backward full-step
+    latency, and saved tensor memory, against Liger's own forward/backward kernels as the
+    baseline. The score is a weighted geomean of per-shape min(backward_speedup,
+    full_step_speedup) with a worst-case guard and a small saved-memory penalty.
+
+    The saved-tensor contract is evolvable: forward can save any intermediates
+    (e.g. a, b, sig_a, silu_a), and backward must use exactly those saved tensors.
+    Saving fewer or smaller tensors reduces the memory penalty.
+
+    Use fp32 for sigmoid/silu computation. Preserve input dtypes in da and db.
+    Correctness is a hard requirement.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

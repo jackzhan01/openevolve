@@ -1,0 +1,52 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-5.5"
+  primary_model_weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 300
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an autograd-pair kernel.
+    Your target to beat is Liger's hand-optimized KL-Divergence Triton kernel, not PyTorch autograd.
+
+        Small suite: V < 16384. Forward reduction fits one block.
+
+    Improve the code inside the EVOLVE-BLOCK. The public API is:
+
+        def kl_div_forward_with_saved(y_pred, y_true):
+            return loss, saved_tensors
+
+        def kl_div_backward_from_saved(dloss, saved_tensors):
+            return d_input
+
+        Forward: loss = sum_ij y_true*(log y_true - y_pred)/BT, scalar (batchmean). y_pred=log-probs, y_true=probs.
+        Backward: d_input = dloss*(-y_true)/BT, only wrt y_pred (element-wise, no reduction). dloss is SCALAR.
+
+        Flexible saved contract: forward saves y_true (needed for backward) into saved_tensors; backward returns d_input [BT,V]. Backward is a pure element-wise scale of -y_true.
+
+    The evaluator scores a weighted geomean of per-shape min(backward_speedup, full_step_speedup) against Liger's own forward/backward kernels as the
+    baseline, with a small saved-memory penalty. Correctness is a hard requirement.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

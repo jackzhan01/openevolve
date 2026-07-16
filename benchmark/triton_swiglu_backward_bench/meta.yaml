@@ -1,0 +1,81 @@
+task_name: triton_swiglu_backward_bench
+operator: swiglu
+difficulty_level: 2
+difficulty_label: elementwise_backward
+description: >
+  Forward-to-backward Triton benchmark task for element-wise SwiGLU
+  (SiLU-gated MLP activation). The backward is purely element-wise (no
+  reductions), with inputs a, b both [rows, cols]. Liger serves as the
+  strong performance baseline.
+
+forward:
+  formula: "c = silu(a) * b,  silu(x) = x * sigmoid(x)"
+  reduction_axis: none
+  inputs:
+    a:
+      shape: "[rows, cols]"
+      layout: contiguous
+    b:
+      shape: "[rows, cols]"
+      layout: contiguous
+  output:
+    c:
+      shape: "[rows, cols]"
+
+backward:
+  upstream_gradient: dc
+  required_gradients:
+    - da
+    - db
+  formulas:
+    sig_a: "sigmoid(a)"
+    silu_a: "a * sig_a"
+    db: "dc * silu_a"
+    da: "dc * b * (silu_a * (1 - sig_a) + sig_a)"
+
+workloads:
+  correctness:
+    shapes:
+      - [8, 64]
+      - [17, 128]
+      - [32, 256]
+      - [64, 512]
+    dtypes:
+      - float32
+      - float16
+      - bfloat16
+  benchmark:
+    shapes:
+      - [1, 512]
+      - [8, 1024]
+      - [32, 2048]
+      - [8, 4096]
+      - [1, 8192]
+      - [512, 4096]
+      - [2048, 4096]
+      - [512, 14336]
+      - [2048, 14336]
+      - [17, 255]
+      - [17, 1001]
+    dtypes:
+      - float32
+      - float16
+      - bfloat16
+
+tolerances:
+  float32:
+    atol: 2.0e-5
+    rtol: 2.0e-5
+  float16:
+    atol: 5.0e-2
+    rtol: 5.0e-2
+  bfloat16:
+    atol: 8.0e-2
+    rtol: 8.0e-2
+
+baselines:
+  pytorch_autograd: backward_ref.py
+  naive_triton_backward: backward_naive_triton.py
+  liger: strong_baselines/liger_swiglu.py
+
+strong_baseline: liger

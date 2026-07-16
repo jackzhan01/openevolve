@@ -1,0 +1,28 @@
+{
+  "bench_dir": "/u/wzhan/openevolve/benchmark/triton_cross_entropy_backward_bench",
+  "regime_split": 16384,
+  "per_program_geomean_full": {
+    "full_r1": 3.1283385099727825,
+    "small_r1": 2.740669467987563,
+    "large_r1": 3.143939226718884
+  },
+  "per_program_geomean_bwd": {
+    "full_r1": 2.525490995228996,
+    "small_r1": 1.9649148404936865,
+    "large_r1": 2.394382097419991
+  },
+  "failures": {
+    "full_r1": [],
+    "small_r1": [],
+    "large_r1": []
+  },
+  "full_best": "full_r1",
+  "small_best": "small_r1",
+  "large_best": "large_r1",
+  "threshold_dispatch_geomean": 3.460672236339917,
+  "oracle_geomean": 3.4639775882862813,
+  "full_geomean": 3.1283385099727825,
+  "best_threshold": 40102.66824040515,
+  "regime_collapsed": false,
+  "final_program": "benchmark/triton_cross_entropy_backward_bench/ce_final_dispatched.py"
+}
