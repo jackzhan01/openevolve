@@ -1,0 +1,50 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-5.5"
+  primary_model_weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 300
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an autograd-pair kernel.
+    Your target to beat is Liger's hand-optimized Cross-Entropy Triton kernel, not PyTorch autograd.
+
+    Improve the code inside the EVOLVE-BLOCK. The public API is:
+
+        def cross_entropy_forward_with_saved(logits, target):
+            return loss, saved_tensors
+
+        def cross_entropy_backward_from_saved(dloss, saved_tensors):
+            return dlogits
+
+        Forward: loss = mean_i(logsumexp(logits_i) - logits_i[target_i]), scalar. logits [BT,V], target [BT] int64.
+        Backward: p=softmax(logits); dlogits = dloss*(p - onehot(target))/N, N=BT. dloss is a SCALAR cotangent.
+
+        Flexible saved contract: forward may save softmax/logits and the int64 target (needed to place the -1 at the label); backward returns dlogits [BT,V]. Liger stores grad in logits in-place and scales in backward in-place, so a wrapper must clone for idempotency.
+
+    The evaluator scores min(backward_speedup, full_step_speedup) against Liger's own forward/backward kernels as the
+    baseline, with a small saved-memory penalty. Correctness is a hard requirement.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

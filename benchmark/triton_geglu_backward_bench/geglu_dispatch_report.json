@@ -1,0 +1,37 @@
+{
+  "bench_dir": "/u/wzhan/openevolve/benchmark/triton_geglu_backward_bench",
+  "regime_split": 1000000,
+  "per_program_geomean_full": {
+    "full_r1": 1.3420593318789664,
+    "full_r2": 1.3456618584462123,
+    "small_r1": 1.4394217915423335,
+    "small_r2": 1.343552450886677,
+    "large_r1": 1.3541830115850586,
+    "large_r2": 1.2478166282078713
+  },
+  "per_program_geomean_bwd": {
+    "full_r1": 1.5112941835848812,
+    "full_r2": 1.5127402858108476,
+    "small_r1": 1.5890798455138648,
+    "small_r2": 1.5141150567093424,
+    "large_r1": 1.527857706887329,
+    "large_r2": 1.4875519746448573
+  },
+  "failures": {
+    "full_r1": [],
+    "full_r2": [],
+    "small_r1": [],
+    "small_r2": [],
+    "large_r1": [],
+    "large_r2": []
+  },
+  "full_best": "full_r2",
+  "small_best": "small_r1",
+  "large_best": "large_r1",
+  "threshold_dispatch_geomean": 1.4394217915423335,
+  "oracle_geomean": 1.4405711384749726,
+  "full_geomean": 1.3456618584462123,
+  "best_threshold": null,
+  "regime_collapsed": true,
+  "final_program": "benchmark/triton_geglu_backward_bench/geglu_final_dispatched.py"
+}

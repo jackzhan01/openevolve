@@ -1,0 +1,28 @@
+{
+  "bench_dir": "/u/wzhan/openevolve/benchmark/triton_kl_div_backward_bench",
+  "regime_split": 16384,
+  "per_program_geomean_full": {
+    "full_r1": 2.244738700325384,
+    "small_r1": 1.4410736061080864,
+    "large_r1": 2.2441228681602934
+  },
+  "per_program_geomean_bwd": {
+    "full_r1": 3.4243369631072182,
+    "small_r1": 3.652675859309162,
+    "large_r1": 3.4306975919885505
+  },
+  "failures": {
+    "full_r1": [],
+    "small_r1": [],
+    "large_r1": []
+  },
+  "full_best": "full_r1",
+  "small_best": "small_r1",
+  "large_best": "large_r1",
+  "threshold_dispatch_geomean": 2.2790721988996627,
+  "oracle_geomean": 2.281111077966724,
+  "full_geomean": 2.244738700325384,
+  "best_threshold": 11585.237502960395,
+  "regime_collapsed": false,
+  "final_program": "benchmark/triton_kl_div_backward_bench/kl_final_dispatched.py"
+}
