@@ -1,24 +1,35 @@
 # `autodiff` — one PyTorch forward → a dispatched Triton forward+backward + a benchmark report
 
 `autodiff` is the product interface over this repo's kernel-synthesis pipeline. You hand it a
-single PyTorch forward (in a file); it returns a shape-dispatched fused forward+backward kernel and
-a performance report measured against a strong baseline (Liger where one exists, else PyTorch
-autograd) — printing every stage and its live progress as it runs.
+single PyTorch forward — an ordinary `def f(...)` built from torch ops, in a `.py` file — and it
+returns a shape-dispatched fused forward+backward kernel and a performance report measured against a
+strong baseline (Liger where one exists, else PyTorch autograd), printing every stage and its live
+progress as it runs.
+
+`--forward` accepts `path/to/file.py` (auto-detects the single top-level function),
+`path/to/file.py:fn_name` (when the file has several), or an importable `module.path:fn`. The
+examples below point at an existing forward in the repo so they run as-is — for your own operator,
+just drop a `.py` file with the forward function and point `--forward` at it.
 
 ```python
 from pipeline.case_harness_agent.autodiff import autodiff
 
-result = autodiff("my_rmsnorm.py", op="rmsnorm")   # a forward file in
+result = autodiff(
+    "benchmark/triton_layernorm_backward_bench/forward_ref.py:layernorm_forward_ref",
+    op="layernorm", bench_dir="benchmark/triton_layernorm_auto_backward_bench",
+)
 print(result.program)   # <op>_final_dispatched.py  — the deployed fw+bwd
 print(result.report)    # RESULTS_<op>_vs_<baseline>.md
 print(result.metrics)   # <op>_dispatch_report.json (measured baseline + geomeans)
 print(result.baseline)  # "liger" | "pytorch_autograd"
 ```
 
-Shell form:
+Shell form (needs a GPU and `OPENAI_API_KEY`):
 
 ```bash
-python -m pipeline.case_harness_agent.autodiff --forward my_rmsnorm.py --op rmsnorm
+python -m pipeline.case_harness_agent.autodiff \
+  --forward benchmark/triton_layernorm_backward_bench/forward_ref.py:layernorm_forward_ref \
+  --op layernorm --bench-dir benchmark/triton_layernorm_auto_backward_bench
 ```
 
 ## What it does — the stages
