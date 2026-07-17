@@ -11,13 +11,28 @@ progress as it runs.
 examples below point at an existing forward in the repo so they run as-is — for your own operator,
 just drop a `.py` file with the forward function and point `--forward` at it.
 
+From the Python API the forward can also be **the function object itself** — it is snapshotted to
+`<bench_dir>/user_forward.py` at the entry (the record of exactly which forward was run) and the
+file-based pipeline runs unchanged. The callable must be a self-contained named `def` over torch
+ops: lambdas, closures, and globals beyond `math`/`torch`/`F` are rejected up front with a message
+saying to use the file form instead.
+
 ```python
 from pipeline.case_harness_agent.autodiff import autodiff
 
+# file form
 result = autodiff(
     "benchmark/triton_layernorm_backward_bench/forward_ref.py:layernorm_forward_ref",
     op="layernorm", bench_dir="benchmark/triton_layernorm_auto_backward_bench",
 )
+
+# callable form — same contract, minus creating a file yourself
+def my_layernorm(x, weight, bias, eps=1e-5):
+    mean = x.mean(dim=-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+    return (x - mean) / torch.sqrt(var + eps) * weight + bias
+
+result = autodiff(my_layernorm, op="layernorm", bench_dir="benchmark/triton_layernorm_auto_backward_bench")
 print(result.program)   # <op>_final_dispatched.py  — the deployed fw+bwd
 print(result.report)    # RESULTS_<op>_vs_<baseline>.md
 print(result.metrics)   # <op>_dispatch_report.json (measured baseline + geomeans)
