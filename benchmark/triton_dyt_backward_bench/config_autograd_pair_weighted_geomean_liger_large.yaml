@@ -1,0 +1,51 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-5.5"
+  primary_model_weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 300
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an autograd-pair kernel.
+    Your target to beat is Liger's hand-optimized Dyt implementation.
+
+        Large-regime suite: specialize for the streaming / high-occupancy end.
+
+    Improve the code inside the EVOLVE-BLOCK. The public API is:
+
+        def dyt_forward_with_saved(x, alpha, gamma, beta):
+            return out, saved_tensors
+
+        def dyt_backward_from_saved(dout, saved_tensors):
+            return dx, dalpha, dgamma, dbeta
+
+        Forward: with scalar alpha and per-column gamma/beta, y[i,j] = gamma[j] * tanh(alpha * x[i,j]) + beta[j], computed in fp32 and cast back to x dtype. Backward: for upstream g, let t[i,j]=tanh(alpha*x[i,j]); dx[i,j]=g[i,j]*gamma[j]*alpha*(1-t[i,j]^2), dgamma[j]=sum_i g[i,j]*t[i,j], dbeta[j]=sum_i g[i,j], and dalpha=sum_{i,j} g[i,j]*gamma[j]*x[i,j]*(1-t[i,j]^2).
+
+        y = gamma*tanh(alpha*x)+beta; grads use tanh' = 1 - tanh(alpha*x)^2 with reductions for alpha, gamma, and beta.
+
+    The evaluator scores a weighted geomean of per-shape min(backward_speedup, full_step_speedup) against Liger's hand-optimized forward/backward as the
+    baseline, with a small saved-memory penalty. Correctness is a hard requirement.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

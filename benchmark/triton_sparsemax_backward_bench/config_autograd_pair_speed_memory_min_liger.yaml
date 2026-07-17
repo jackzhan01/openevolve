@@ -1,0 +1,49 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-5.5"
+  primary_model_weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 300
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an autograd-pair kernel.
+    Your target to beat is Liger's hand-optimized Sparsemax implementation.
+
+    Improve the code inside the EVOLVE-BLOCK. The public API is:
+
+        def sparsemax_forward_with_saved(x):
+            return out, saved_tensors
+
+        def sparsemax_backward_from_saved(dout, saved_tensors):
+            return dx
+
+        Forward: for each row, sparsemax projects logits x onto the probability simplex: sort scores, find support S, tau=(sum_{j in S} x_j - 1)/|S|, and output p_i=max(x_i - tau, 0). Backward: for upstream gradient g, gradients are only on the active support S={i:p_i>0}; dx_i = g_i - mean_{j in S}(g_j) for i in S, and dx_i=0 outside S.
+
+        p=max(x-tau,0); dx=mask*(g - sum(mask*g)/sum(mask)) with reductions over the last dimension per row.
+
+    The evaluator scores min(backward_speedup, full_step_speedup) against Liger's hand-optimized forward/backward as the
+    baseline, with a small saved-memory penalty. Correctness is a hard requirement.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

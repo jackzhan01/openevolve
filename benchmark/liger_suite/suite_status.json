@@ -1,0 +1,23 @@
+{
+  "dyt": {
+    "ok": true,
+    "seconds": 128.9,
+    "task_spec": true,
+    "wrapper": true,
+    "notes": "y = gamma*tanh(alpha*x)+beta; HAVE_BETA=True; all 4 inputs differentiable"
+  },
+  "sparsemax": {
+    "ok": true,
+    "seconds": 73.0,
+    "task_spec": true,
+    "wrapper": true,
+    "notes": "simplex projection, dim=-1 pinned"
+  },
+  "fused_add_rms_norm": {
+    "ok": true,
+    "seconds": 82.5,
+    "task_spec": true,
+    "wrapper": true,
+    "notes": "single-output form of Liger's two-output (y, s) kernel; offset=0, llama casting; wrapper may need hand-written fallback"
+  }
+}

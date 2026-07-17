@@ -1,0 +1,49 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-5.5"
+  primary_model_weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 300
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an autograd-pair kernel.
+    Your target to beat is Liger's hand-optimized Jsd implementation.
+
+    Improve the code inside the EVOLVE-BLOCK. The public API is:
+
+        def jsd_forward_with_saved(log_q, target):
+            return out, saved_tensors
+
+        def jsd_backward_from_saved(dout, saved_tensors):
+            return dlog_q
+
+        Forward: target is log_p, log_q is predicted log-probabilities; p=exp(log_p), q=exp(log_q), m=0.5*p+0.5*q, and output is JSD=(0.5*sum p*(log_p-log_m)+0.5*sum q*(log_q-log_m))/rows. Backward: compute gradient only w.r.t. log_q; target/log_p is a fixed non-differentiated target. The gradient is elementwise: dL/dlog_q = 0.5*q*(log_q-log_m)/rows.
+
+        JSD(log_p,log_q)=0.5*KL(p||m)+0.5*KL(q||m), m=0.5*(p+q), divided by rows; grad_log_q=0.5*q*(log_q-log_m)/rows.
+
+    The evaluator scores min(backward_speedup, full_step_speedup) against Liger's hand-optimized forward/backward as the
+    baseline, with a small saved-memory penalty. Correctness is a hard requirement.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

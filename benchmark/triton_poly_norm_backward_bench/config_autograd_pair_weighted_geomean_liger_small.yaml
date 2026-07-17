@@ -1,0 +1,51 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-5.5"
+  primary_model_weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 300
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing an autograd-pair kernel.
+    Your target to beat is Liger's hand-optimized PolyNorm implementation.
+
+        Small-regime suite: specialize for the single-pass / low-occupancy end.
+
+    Improve the code inside the EVOLVE-BLOCK. The public API is:
+
+        def poly_norm_forward_with_saved(x, weight, bias, eps):
+            return out, saved_tensors
+
+        def poly_norm_backward_from_saved(dout, saved_tensors, eps):
+            return dx, dweight, dbias
+
+        Forward: for p in {3,2,1}, compute per-row normalized polynomial features n_p = x^p / sqrt(mean_lastdim(x^(2p)) + eps), then y = weight[0]*n_3 + weight[1]*n_2 + weight[2]*n_1 + bias, with computation in float32 and output cast to x dtype. Backward: compute gradients w.r.t. x, weight, and bias. For upstream g, dbias_j = sum_i g_ij, dweight_pj = sum_i g_ij*n_pij, and dx uses per-row reductions S_ip = sum_j (g_ij*weight_pj*x_ij^p) through the derivative of the row RMS normalization.
+
+        n_p=x^p*rsqrt(mean_j(x^(2p))+eps); d/dz of z*r is r*h - z*r^3*mean_j(h*z), then chain by dz/dx=p*x^(p-1).
+
+    The evaluator scores a weighted geomean of per-shape min(backward_speedup, full_step_speedup) against Liger's hand-optimized forward/backward as the
+    baseline, with a small saved-memory penalty. Correctness is a hard requirement.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 300
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000

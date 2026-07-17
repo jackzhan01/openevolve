@@ -15,11 +15,12 @@ tests/atenir_correctness/          # Unified correctness harness and regression 
 
 ## `autodiff` — the one-call interface
 
-The whole pipeline is packaged behind a single interface: give it **one PyTorch forward in a file**
-and it returns a shape-dispatched fused **forward+backward** kernel and a **performance report** vs a
-strong baseline (PyTorch autograd, or Liger for the ops it covers), printing each stage's live
-progress as it runs. It assumes it is already on a GPU — allocating the node / setting up the env is
-the caller's concern, never the pipeline's.
+The whole pipeline is packaged behind a single interface: give it **one PyTorch forward** — a path
+to a `.py` file, or **the function object itself** — and it returns a shape-dispatched fused
+**forward+backward** kernel and a **performance report** vs a strong baseline (PyTorch autograd, or
+Liger for the ops it covers), printing each stage's live progress as it runs. It assumes it is
+already on a GPU — allocating the node / setting up the env is the caller's concern, never the
+pipeline's.
 
 ```bash
 # needs a GPU and OPENAI_API_KEY; here the forward is an existing reference file in the repo
@@ -27,6 +28,20 @@ python -m pipeline.case_harness_agent.autodiff \
   --forward benchmark/triton_layernorm_backward_bench/forward_ref.py:layernorm_forward_ref \
   --op layernorm --bench-dir benchmark/triton_layernorm_auto_backward_bench \
   --iterations 10 --gpus 3
+```
+
+From Python, the forward can be passed as a plain callable — it is snapshotted to
+`<bench_dir>/user_forward.py` at the entry and the file-based pipeline runs unchanged:
+
+```python
+from pipeline.case_harness_agent.autodiff import autodiff
+
+def my_layernorm(x, weight, bias, eps=1e-5):
+    mean = x.mean(dim=-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+    return (x - mean) / torch.sqrt(var + eps) * weight + bias
+
+result = autodiff(my_layernorm, op="layernorm", iterations=10)
 ```
 
 From the forward alone it runs five stages, with every gate's notion of "correct" kept independent
@@ -44,6 +59,32 @@ of the LLM that wrote the code:
 
 Full interface docs — file map, baseline handling, `--gpus 1|3`, live progress — are in
 [`pipeline/case_harness_agent/README.md`](pipeline/case_harness_agent/README.md).
+
+## Liger benchmark suite
+
+`benchmark/liger_suite/` builds benchmark cases for [Liger](https://github.com/linkedin/Liger-Kernel)
+operators **automatically**: each op needs only a hand-written naive PyTorch forward
+(`liger_suite/forwards/*.py`, ~10 lines each, semantics pinned against Liger's source), and the
+suite driver runs the pipeline's `taskspec + prep` stages to produce everything else — the
+code-derived task spec and oracles, the evaluator scaffolding, and a **gated** Liger baseline
+wrapper (verified against the PyTorch oracle on every forward output and gradient).
+
+```bash
+# needs a GPU and OPENAI_API_KEY; one op failing does not block the rest
+python -m benchmark.liger_suite.run_suite            # all manifest ops
+python -m benchmark.liger_suite.run_suite --only dyt # a subset
+```
+
+Current coverage: 7 auto-built cases (`dyt`, `relu_squared`, `sparsemax`, `tvd`, `jsd`,
+`poly_norm`, `fused_add_rms_norm`) on top of the 7 hand-written ones (swiglu, geglu, rmsnorm,
+layernorm, softmax, cross_entropy, kl_div) — 14 Liger ops total. Ops whose inputs do not fit the
+current 2D rows×cols case contract (rope / attention / fused_linear families) are out of scope
+until the case schema is generalized.
+
+Every auto-synthesized baseline wrapper was manually reviewed for benchmark fairness (no
+host-device syncs, no extra tensor passes in the timed regions, saved-tensor sets matching
+Liger's own `autograd.Function`) — verdicts and the known semantic caveats are recorded in
+[`benchmark/liger_suite/WRAPPER_REVIEW.md`](benchmark/liger_suite/WRAPPER_REVIEW.md).
 
 ## Benchmark
 
