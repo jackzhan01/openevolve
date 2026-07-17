@@ -1,6 +1,6 @@
-# `autodiff` — one PyTorch forward → a dispatched Triton forward+backward + a benchmark report
+# `evograd` — one PyTorch forward → a dispatched Triton forward+backward + a benchmark report
 
-`autodiff` is the product interface over this repo's kernel-synthesis pipeline. You hand it a
+`evograd` is the product interface over this repo's kernel-synthesis pipeline. You hand it a
 single PyTorch forward — an ordinary `def f(...)` built from torch ops, in a `.py` file — and it
 returns a shape-dispatched fused forward+backward kernel and a performance report measured against a
 strong baseline (Liger where one exists, else PyTorch autograd), printing every stage and its live
@@ -18,10 +18,10 @@ ops: lambdas, closures, and globals beyond `math`/`torch`/`F` are rejected up fr
 saying to use the file form instead.
 
 ```python
-from pipeline.case_harness_agent.autodiff import autodiff
+from pipeline.case_harness_agent.evograd import evograd
 
 # file form
-result = autodiff(
+result = evograd(
     "benchmark/triton_layernorm_backward_bench/forward_ref.py:layernorm_forward_ref",
     op="layernorm", bench_dir="benchmark/triton_layernorm_auto_backward_bench",
 )
@@ -32,7 +32,7 @@ def my_layernorm(x, weight, bias, eps=1e-5):
     var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
     return (x - mean) / torch.sqrt(var + eps) * weight + bias
 
-result = autodiff(my_layernorm, op="layernorm", bench_dir="benchmark/triton_layernorm_auto_backward_bench")
+result = evograd(my_layernorm, op="layernorm", bench_dir="benchmark/triton_layernorm_auto_backward_bench")
 print(result.program)   # <op>_final_dispatched.py  — the deployed fw+bwd
 print(result.report)    # RESULTS_<op>_vs_<baseline>.md
 print(result.metrics)   # <op>_dispatch_report.json (measured baseline + geomeans)
@@ -42,7 +42,7 @@ print(result.baseline)  # "liger" | "pytorch_autograd"
 Shell form (needs a GPU and `OPENAI_API_KEY`):
 
 ```bash
-python -m pipeline.case_harness_agent.autodiff \
+python -m pipeline.case_harness_agent.evograd \
   --forward benchmark/triton_layernorm_backward_bench/forward_ref.py:layernorm_forward_ref \
   --op layernorm --bench-dir benchmark/triton_layernorm_auto_backward_bench
 ```
@@ -73,11 +73,11 @@ define the standard it's judged by.
 
 ## Where the code lives
 
-Product (the `autodiff` chain):
+Product (the `evograd` chain):
 
 ```
 pipeline/case_harness_agent/
-  autodiff.py                 # the product entry — file-in / file-out, returns artifact paths
+  evograd.py                  # the product entry — file-in / file-out, returns artifact paths
   orchestrate.py              # the six-stage driver (stage banners, streaming _run, evolve modes)
   synthesize_task_spec.py     # taskspec: forward → spec + code-derived contract/oracles/tolerances
   scaffold.py                 # generates evaluators + configs for a case
@@ -92,13 +92,16 @@ benchmark/triton_backward_bench_common/
 ```
 
 The other `pipeline/*/` packages and top-level `pipeline/run_*.py` scripts are earlier experiments
-(handwritten dispatch, no-atenir fusion, lowering agents, …) and are **not** on the `autodiff` path.
+(handwritten dispatch, no-atenir fusion, lowering agents, …) and are **not** on the `evograd` path.
 
 ## Input and output are files
 
 - **Input** `--forward` is a path to a `.py` file. `path.py` auto-detects the single top-level
   function; `path.py:fn` names one when the file has several. (A `module.path:fn` import path also
-  still works — the pipeline uses it internally.)
+  still works — the pipeline uses it internally.) `--forward` is **optional for an op the registry
+  already knows** (a built case, or one declared in the suite manifest) — its forward, Liger
+  sources, and baseline are looked up. List them with `python -m benchmark.op_registry`; an unknown
+  op reports the available names and the reminder to pass `--forward` for an ad-hoc run.
 - **Output** is written under the bench dir (default `benchmark/triton_<op>_backward_bench`, or
   `--bench-dir`): `<op>_final_dispatched.py`, `RESULTS_<op>_vs_<baseline>.md`,
   `<op>_dispatch_report.json`.
@@ -122,7 +125,7 @@ with `--liger-source` (repeatable). The only trustworthy record of what was meas
   machine with a single GPU can run it.
 - `--gpus 3`: the three groups run **in parallel**, one per GPU (`CUDA_VISIBLE_DEVICES=0,1,2`) on a
   single node with ≥3 visible GPUs. Same three-way parallelism as three nodes, but no cross-node
-  scheduling — which fits `autodiff` being one process.
+  scheduling — which fits `evograd` being one process.
 
 **The pipeline never allocates nodes / calls `srun`.** It assumes it is already on a GPU with the
 env and `OPENAI_API_KEY` ready. Getting onto a node and setting that up is the caller's environment

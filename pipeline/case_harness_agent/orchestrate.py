@@ -387,7 +387,7 @@ def stage_evolve(cfg: OrchestratorConfig, group: str) -> int:
 def stage_evolve_parallel(cfg: OrchestratorConfig, groups: list[str]) -> int:
     """Run the groups CONCURRENTLY, one per GPU (CUDA_VISIBLE_DEVICES=0,1,2,...).
 
-    autodiff runs as a single process on one node, so 'parallel across N GPUs' is just N child
+    evograd runs as a single process on one node, so 'parallel across N GPUs' is just N child
     processes each pinned to a distinct GPU — no multi-node scheduling, no srun from inside the
     pipeline. Each child's output goes to its own .orch_evolve_<group>.log; while they run we print
     a combined per-group iteration line from openevolve's live logs (interleaving 3 streams onto one
@@ -644,7 +644,7 @@ def _banner(msg: str) -> None:
 def orchestrate(cfg: OrchestratorConfig, stages: list[str], groups: list[str]) -> int:
     t0 = time.time()
     active = [s for s in _STAGE_ORDER if s in stages]
-    _banner(f"autodiff op={cfg.op}  stages={active}")
+    _banner(f"evograd op={cfg.op}  stages={active}")
     baseline, _ = _resolve_baseline(cfg)
     print(f"perf baseline: {baseline} (--perf-baseline {cfg.perf_baseline})", flush=True)
     if "taskspec" in stages:
