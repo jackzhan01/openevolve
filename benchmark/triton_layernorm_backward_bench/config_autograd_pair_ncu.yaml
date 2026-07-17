@@ -76,5 +76,5 @@ diff_based_evolution: true
 max_code_length: 30000
 
 # NCU silent optimizer pass
-ncu_enable: false   # set true to activate the LLM optimizer pass
-ncu_freq: 10        # run optimizer every N iterations
+ncu_enable: true # set true to activate the LLM optimizer pass
+ncu_freq: 3 # run optimizer every N iterations

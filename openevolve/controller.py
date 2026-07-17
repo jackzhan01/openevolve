@@ -501,6 +501,17 @@ class OpenEvolve:
                 f"{format_metrics_safe(best_program.metrics)}"
             )
 
+        # Include NCU pass records (written by workers into <output_dir>/ncu_passes/)
+        # so each checkpoint carries the full optimizer history up to this point.
+        ncu_passes_dir = os.path.join(self.output_dir, "ncu_passes")
+        if os.path.isdir(ncu_passes_dir):
+            shutil.copytree(
+                ncu_passes_dir,
+                os.path.join(checkpoint_path, "ncu_passes"),
+                dirs_exist_ok=True,
+            )
+            logger.info(f"Copied NCU pass records into checkpoint {iteration}")
+
         logger.info(f"Saved checkpoint at iteration {iteration} to {checkpoint_path}")
 
     def _load_checkpoint(self, checkpoint_path: str) -> None:

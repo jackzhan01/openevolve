@@ -1,7 +1,7 @@
-"""NCU-aware wrapper around the LayerNorm autograd-pair evaluator.
+"""NCU-aware wrapper around the KL-Divergence autograd-pair evaluator.
 
 Runs the normal timing-based evaluator first. If the candidate is correct and
-NCU_MODE is not "off", profiles it with `ncu` and returns the hardware metrics
+NCU mode is not "off", profiles it with `ncu` and returns the hardware metrics
 as `ncu_*` keys in the metrics dict plus `ncu_report_path` in artifacts.
 
 The metrics and report path are consumed by the NCU silent optimizer in

@@ -1,0 +1,68 @@
+max_iterations: 10
+checkpoint_interval: 5
+log_level: "INFO"
+max_tasks_per_child: 1
+
+llm:
+  primary_model: "gpt-5.5"
+  primary_model_weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.5
+  max_tokens: 20000
+  timeout: 180
+
+prompt:
+  system_message: |
+    You are an expert Triton GPU programmer optimizing a KL-Divergence autograd pair.
+
+    Improve the code inside the EVOLVE-BLOCK.  The public API is a
+    forward/backward pair with a flexible saved-tensor contract:
+
+        def kl_div_forward_with_saved(y_pred, y_true):
+            return loss, saved_tensors
+
+        def kl_div_backward_from_saved(dloss, saved_tensors):
+            return d_input
+
+    Forward: loss = sum_ij( y_true * (log(y_true) - y_pred) ) / BT, a scalar
+    (batchmean reduction).  y_pred is log-probabilities and y_true is
+    probabilities, both contiguous 2D CUDA tensors [BT, V].
+    Backward:
+        d_input = dloss * (-y_true) / BT
+
+    The gradient is only w.r.t. y_pred and is a pure element-wise scale of
+    -y_true (no reduction).  dloss is a SCALAR cotangent.  The saved-tensor
+    contract is evolvable: forward saves y_true (needed by backward).
+
+    Correctness is a hard requirement.  The evaluator verifies the autograd pair
+    against PyTorch autograd and reports saved tensor memory.
+
+    Optimization target:
+    - Improve backward_from_saved latency and forward+backward end-to-end latency.
+    - You may trade extra saved tensor memory for faster backward if beneficial.
+    - Support float32, float16, and bfloat16 benchmark cases.
+    - Use fp32 accumulation for reductions.
+
+    Do not call PyTorch autograd or the corresponding high-level PyTorch op in
+    the generated math.  Prefer Triton kernels for core forward/backward work.
+
+database:
+  population_size: 30
+  archive_size: 20
+  num_islands: 2
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.75
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 420
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 30000
+
+# NCU silent optimizer pass
+ncu_enable: false # set true to activate the LLM optimizer pass
+ncu_freq: 3 # run optimizer every N iterations

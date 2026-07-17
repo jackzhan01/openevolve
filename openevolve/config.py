@@ -433,7 +433,8 @@ class Config:
     # NCU-guided optimization (silent post-evaluation pass; evolver never sees NCU data)
     ncu_enable: bool = False
     ncu_freq: int = 10          # Run the NCU pass every N iterations
-    ncu_optimizer_timeout: int = 180  # Wall-clock cap (s) for the NCU optimizer LLM call
+    ncu_optimizer_timeout: int = 360  # Wall-clock cap (s) for the diagnosis + generation LLM calls
+    ncu_skip_at_roofline_pct: float = 95.0  # Skip the pass when max SOL >= this (already at hardware limit)
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "Config":

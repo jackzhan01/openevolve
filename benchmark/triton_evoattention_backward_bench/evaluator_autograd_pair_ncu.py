@@ -37,10 +37,16 @@ except Exception:  # pragma: no cover
         artifacts: dict[str, str | bytes] = field(default_factory=dict)
 
 
-NCU_MODE = os.environ.get("AUTOGRAD_PAIR_NCU_MODE", "always")  # off | always
+# NCU_MODE is read at call time (not import time) so the OpenEvolve worker can
+# toggle profiling per iteration via os.environ — only NCU-pass iterations pay
+# the ~20-30s profiling cost.
 NCU_TIMEOUT = int(os.environ.get("AUTOGRAD_PAIR_NCU_TIMEOUT", "120"))
 NCU_WARMUP = int(os.environ.get("AUTOGRAD_PAIR_NCU_WARMUP", "5"))
 NCU_SHAPE = os.environ.get("AUTOGRAD_PAIR_NCU_SHAPE")
+
+
+def _ncu_mode() -> str:
+    return os.environ.get("AUTOGRAD_PAIR_NCU_MODE", "always")  # off | always
 
 
 def _representative_case():
@@ -58,7 +64,7 @@ def evaluate(program_path: str) -> EvaluationResult:
     if result.metrics.get("correct", 0.0) != 1.0:
         return result
 
-    if NCU_MODE == "off":
+    if _ncu_mode() == "off":
         return result
 
     case = _representative_case()
