@@ -88,40 +88,39 @@ Liger's own `autograd.Function`) — verdicts and the known semantic caveats are
 
 ## Benchmark
 
-`benchmark/` contains public tasks and shared benchmark infrastructure. The
-first benchmark is LayerNorm backward:
+`benchmark/` is a suite of Triton **backward-kernel benchmark cases** built around
+[Liger](https://github.com/linkedin/Liger-Kernel) operators — currently 14 ops (swiglu, geglu,
+rmsnorm, layernorm, softmax, cross_entropy, kl_div, dyt, relu_squared, sparsemax, tvd, jsd,
+poly_norm, fused_add_rms_norm), with the goal of covering all Liger operators. Every case pairs a
+PyTorch ground truth with a fairness-reviewed Liger baseline, so a candidate kernel can be checked
+for correctness and timed against a strong target with one command.
+
+Anatomy of a case (`benchmark/triton_dyt_backward_bench/` as the example):
 
 ```text
-benchmark/triton_layernorm_backward_bench/
-benchmark/triton_backward_bench_common/
+forward_ref.py                  # the PyTorch reference forward — the case's ground truth
+task_spec.py                    # the contract: shapes/dtypes/tolerances, correctness oracles,
+                                #   benchmark suites (full + small/large shape regimes)
+evaluator_autograd_pair*.py     # evaluators: hard correctness gate first, then timing vs the
+config_autograd_pair*.yaml      #   baseline; one per scoring mode, with its OpenEvolve config
+strong_baselines/liger_dyt.py   # the gated Liger baseline (verified against the PyTorch oracle
+                                #   on every forward output and gradient)
 ```
 
-The LayerNorm benchmark defines the forward reference, PyTorch-autograd oracle,
-Triton baseline, OpenEvolve config, and evaluator wrapper. The shared common
-package contains `evaluator_core.py`, which is the hard correctness gate used by
-OpenEvolve before timing any generated candidate.
-
-Useful commands:
+A candidate program exposes the pair API named in `task_spec.py` —
+`<op>_forward_with_saved(*inputs) -> (y, saved)` and
+`<op>_backward_from_saved(dout, saved, *extras) -> grads` — and is evaluated with:
 
 ```bash
-python benchmark/triton_layernorm_backward_bench/test_correctness.py
-python benchmark/triton_layernorm_backward_bench/evaluator.py   benchmark/triton_layernorm_backward_bench/initial_program.py
-
-python -m benchmark.triton_backward_bench_common.builder_cli emit-spec   benchmark/triton_layernorm_backward_bench
+# hard correctness gate, then benchmark timing vs the Liger baseline (needs a GPU)
+python benchmark/triton_dyt_backward_bench/evaluator_autograd_pair_speed_memory_min_liger.py \
+  path/to/candidate_program.py
 ```
 
-To run OpenEvolve on the LayerNorm seed:
-
-```bash
-python -m openevolve.cli   benchmark/triton_layernorm_backward_bench/initial_program.py   benchmark/triton_layernorm_backward_bench/evaluator.py   --config benchmark/triton_layernorm_backward_bench/config.yaml   --iterations 10   --output /tmp/openevolve_triton_layernorm_backward_10   --save-best-to benchmark/triton_layernorm_backward_bench/evolved_best_program.py
-```
-
-To run the LayerNorm autograd-pair saved-tensor experiment, where the candidate
-evolves both the forward saved tensors and the backward-from-saved kernel:
-
-```bash
-openevolve-run   benchmark/triton_layernorm_backward_bench/initial_program_autograd_pair.py   benchmark/triton_layernorm_backward_bench/evaluator_autograd_pair_speed_memory.py   --config benchmark/triton_layernorm_backward_bench/config_autograd_pair_speed_memory.yaml   --iterations 10   --output /tmp/openevolve_layernorm_autograd_pair_speed_memory_10   --save-best-to benchmark/triton_layernorm_backward_bench/evolved_best_autograd_pair_speed_memory.py
-```
+or end-to-end (seed + evolve + dispatch + report) through `autodiff` with `--forward` pointed at
+the case's `forward_ref.py`. The shared gate/timing machinery lives in
+`benchmark/triton_backward_bench_common/`; baseline fairness verdicts and known semantic caveats
+are recorded in [`benchmark/liger_suite/WRAPPER_REVIEW.md`](benchmark/liger_suite/WRAPPER_REVIEW.md).
 
 ## Pipelines
 
