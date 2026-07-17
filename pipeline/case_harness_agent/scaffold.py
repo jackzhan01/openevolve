@@ -64,7 +64,7 @@ for _p in (BENCHMARK_DIR, REPO_ROOT):
     sys.path.insert(0, _p)
 
 from benchmark.triton_backward_bench_common.autograd_pair_evaluator_core import (  # noqa: E402
-    evaluate_autograd_pair_program,
+    evaluate_isolated,
     main as core_main,
 )
 
@@ -75,7 +75,8 @@ except ImportError:  # pragma: no cover
 
 
 def evaluate(program_path: str):
-    return evaluate_autograd_pair_program(program_path, task_spec)
+    # Isolated: a killed subprocess takes its CUDA context (and any deadlocked kernel) with it.
+    return evaluate_isolated(os.path.abspath(__file__), program_path, task_spec)
 
 
 if __name__ == "__main__":
@@ -97,7 +98,7 @@ for _p in (BENCHMARK_DIR, REPO_ROOT):
     sys.path.insert(0, _p)
 
 from benchmark.triton_backward_bench_common.autograd_pair_evaluator_core import (  # noqa: E402
-    evaluate_autograd_pair_program,
+    evaluate_isolated,
     main as core_main,
 )
 
@@ -108,7 +109,8 @@ except ImportError:  # pragma: no cover
 
 
 def evaluate(program_path: str):
-    return evaluate_autograd_pair_program(program_path, task_spec)
+    # Isolated: a killed subprocess takes its CUDA context (and any deadlocked kernel) with it.
+    return evaluate_isolated(os.path.abspath(__file__), program_path, task_spec)
 
 
 if __name__ == "__main__":
@@ -160,7 +162,9 @@ def _config(spec: CaseSpec, score_desc: str, regime_note: str, suite: str | None
         "  exploitation_ratio: 0.75\n"
         "  similarity_threshold: 0.99\n\n"
         "evaluator:\n"
-        "  timeout: 300\n"
+        # Timing the autograd baseline is ~100x slower per step than Liger, and the first
+        # evaluation also pays Triton cold-compile — 300s only fits the Liger baseline.
+        f"  timeout: {300 if spec.perf_baseline == 'liger' else 900}\n"
         "  parallel_evaluations: 1\n"
         "  cascade_evaluation: false\n\n"
         "diff_based_evolution: true\n"

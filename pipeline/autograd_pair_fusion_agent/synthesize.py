@@ -97,12 +97,17 @@ def _verify_program(config: AutogradPairConfig, program_path: Path) -> dict:
         # An LLM-generated kernel can deadlock / spin on the GPU. Without a timeout the whole
         # pipeline hangs forever on that one candidate; kill it, mark it failed, and let the next
         # attempt proceed. (subprocess.run SIGKILLs the child on timeout, freeing its CUDA context.)
+        # The child's partial stderr carries the evaluator's [smoke]/progress lines — its LAST
+        # line names the case that was running when the hang started, which is exactly what the
+        # repair prompt needs the LLM to know.
+        partial_err = (e.stderr or "") if isinstance(e.stderr, str) else ""
         return {
             "metrics": {"correct": 0.0},
             "artifacts": {},
             "stdout": (e.stdout or "") if isinstance(e.stdout, str) else "",
             "stderr": f"[eval_timeout] candidate killed after {config.eval_timeout}s "
-                      f"(likely a hanging/deadlocked kernel)",
+                      f"(likely a hanging/deadlocked kernel). Progress before the kill "
+                      f"(the LAST line is where it hung):\n{partial_err[-2000:]}",
             "returncode": -9,
         }
     try:

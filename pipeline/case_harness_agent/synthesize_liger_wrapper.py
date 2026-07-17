@@ -305,6 +305,10 @@ def synthesize_liger_wrapper(config: LigerWrapperConfig) -> int:
         previous_code = code
         print(f"attempt {attempt} failed the gate; wrote repair prompt")
 
+    # The gate imports the wrapper from its product location, so every attempt is written there —
+    # but a FAILED synthesis must not leave the last rejected attempt behind: it looks like a
+    # landed artifact and makes the next prep run skip with "wrapper exists".
+    wrapper_path.unlink(missing_ok=True)
     print(f"Liger-wrapper synthesis FAILED after {config.max_attempts} attempts (see {work})")
     return 1
 

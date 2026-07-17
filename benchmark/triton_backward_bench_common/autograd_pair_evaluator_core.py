@@ -20,6 +20,7 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -53,6 +54,33 @@ CAPTURE_NATIVE_OUTPUT = os.environ.get("AUTOGRAD_PAIR_CAPTURE_NATIVE_OUTPUT", "1
 NATIVE_OUTPUT_TAIL_BYTES = int(os.environ.get("AUTOGRAD_PAIR_NATIVE_OUTPUT_TAIL_BYTES", "65536"))
 BENCHMARK_WARMUP = int(os.environ.get("AUTOGRAD_PAIR_BENCHMARK_WARMUP", "10"))
 BENCHMARK_REPS = int(os.environ.get("AUTOGRAD_PAIR_BENCHMARK_REPS", "50"))
+BASELINE_TIMING_CACHE = os.environ.get("AUTOGRAD_PAIR_BASELINE_TIMING_CACHE", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
+# Pristine copies of the process's original stdout/stderr fds, taken at import. If an evaluation
+# is abandoned mid-_capture_native_output (openevolve's timeout drops the worker thread on the
+# floor), fds 1/2 stay dup2'd to its temp file and the console goes dark for the rest of the
+# process. Every evaluate() entry restores them (self-healing) instead.
+try:
+    _PRISTINE_STDOUT_FD = os.dup(1)
+    _PRISTINE_STDERR_FD = os.dup(2)
+except OSError:  # pragma: no cover — no usable std fds (daemonized caller)
+    _PRISTINE_STDOUT_FD = _PRISTINE_STDERR_FD = -1
+
+
+def _restore_std_fds() -> None:
+    if _PRISTINE_STDOUT_FD < 0:
+        return
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os.dup2(_PRISTINE_STDOUT_FD, 1)
+    os.dup2(_PRISTINE_STDERR_FD, 2)
 
 
 def _json(data: dict[str, Any]) -> str:
@@ -241,6 +269,42 @@ def _liger_baseline_fns(task_spec) -> tuple[Callable, Callable]:
     return make_fns()
 
 
+def _smoke_benchmark_shapes(torch_module, task_spec, forward_fn: Callable, backward_fn: Callable) -> dict[str, Any] | None:
+    """One untimed fw+bwd pass per benchmark case; None if all pass, else a failure record.
+
+    Catches shape-dependent crashes — and, together with the CALLER's subprocess timeout,
+    shape-dependent deadlocks — that the small correctness shapes cannot see.
+
+    Progress goes to STDERR line-by-line (stdout must stay clean for the report JSON): if the
+    caller's timeout kills this process, the last [smoke] line in its partial stderr names the
+    hanging case, and the repair prompt can hand the LLM that shape."""
+    cases = _selected_benchmark_cases(task_spec)
+    print(f"[smoke] correctness passed; smoke-running {len(cases)} benchmark shapes once each",
+          file=sys.stderr, flush=True)
+    for case in cases:
+        print(f"[smoke] {_case_report(task_spec, case)}", file=sys.stderr, flush=True)
+        try:
+            if hasattr(task_spec, "seed_for_case"):
+                torch_module.manual_seed(task_spec.seed_for_case(case))
+            inputs = _pair_inputs(task_spec, torch_module, case)
+            dout = inputs[_cotangent_index(task_spec)]
+            forward_args = _forward_args(task_spec, inputs)
+            backward_extra_args = _backward_extra_args(task_spec, inputs)
+            with torch_module.no_grad():
+                _y, saved = forward_fn(*forward_args)
+                backward_fn(dout, _normalize_saved(saved), *backward_extra_args)
+            torch_module.cuda.synchronize()
+            del inputs, dout, saved
+        except Exception as exc:
+            return {
+                "error_type": "BenchmarkShapeSmokeError",
+                "error_message": f"{type(exc).__name__}: {exc}",
+                "case": _case_report(task_spec, case),
+                "traceback": traceback.format_exc(limit=8),
+            }
+    return None
+
+
 def _selected_benchmark_cases(task_spec) -> list[Any]:
     if SUITE == "full":
         return list(task_spec.BENCHMARK_CASES)
@@ -381,11 +445,14 @@ def _run_correctness(
                 reports.append(report)
                 continue
 
+            # Compare in fp32 like _max_errors does: a candidate may legitimately return
+            # higher-precision tensors (fp32 accumulation on a half-precision case), and
+            # torch.allclose raises on mixed dtypes instead of casting.
             forward_max_abs, forward_max_rel = _max_errors(torch_module, actual_y, expected_y)
             forward_ok = bool(
                 torch_module.allclose(
-                    actual_y,
-                    expected_y,
+                    actual_y.float(),
+                    expected_y.float(),
                     atol=_forward_atol(task_spec, case),
                     rtol=_forward_rtol(task_spec, case),
                 )
@@ -417,7 +484,8 @@ def _run_correctness(
                 atol = task_spec.atol(case, name)
                 rtol = task_spec.rtol(case, name)
                 max_abs, max_rel = _max_errors(torch_module, actual_tensor, expected_tensor)
-                is_correct = bool(torch_module.allclose(actual_tensor, expected_tensor, atol=atol, rtol=rtol))
+                is_correct = bool(torch_module.allclose(
+                    actual_tensor.float(), expected_tensor.float(), atol=atol, rtol=rtol))
                 passed_by_output[name] += int(is_correct)
                 report[f"{name}_correct"] = is_correct
                 report[f"{name}_max_abs_error"] = max_abs
@@ -499,6 +567,73 @@ def _median_ms_timed_region(
     return float(statistics.median(times))
 
 
+# --------------------------------------------------------------------------- baseline cache
+# The baseline's latency per case is a constant for the whole evolve run (same shapes, same
+# baseline, same GPU) — but naively it gets re-timed inside EVERY candidate evaluation, which
+# under the slow autograd baseline dominates evaluation time. Cache it on disk next to the
+# task_spec, keyed by everything the number depends on. Evaluations run in separate worker
+# processes, so the cache must be a file, not a dict; writes are atomic (tmp + rename) and
+# merge the freshest file contents so concurrent workers don't clobber each other's entries.
+
+_BASELINE_CACHE_MEMO: dict[str, dict[str, Any]] = {}
+
+
+def _baseline_cache_path(task_spec) -> str | None:
+    spec_file = getattr(task_spec, "__file__", None)
+    if not BASELINE_TIMING_CACHE or not spec_file:
+        return None
+    return os.path.join(os.path.dirname(os.path.abspath(spec_file)), ".baseline_timing_cache.json")
+
+
+def _baseline_cache_key(torch_module, task_spec, case) -> str:
+    gpu = torch_module.cuda.get_device_name(0) if torch_module.cuda.is_available() else "cpu"
+    return json.dumps(
+        {
+            "baseline": PERFORMANCE_BASELINE,
+            "gpu": gpu,
+            "warmup": BENCHMARK_WARMUP,
+            "reps": BENCHMARK_REPS,
+            "case": _case_report(task_spec, case),
+        },
+        sort_keys=True,
+        default=repr,
+    )
+
+
+def _baseline_cache_get(torch_module, task_spec, case) -> tuple[float, float] | None:
+    path = _baseline_cache_path(task_spec)
+    if path is None:
+        return None
+    if path not in _BASELINE_CACHE_MEMO:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                _BASELINE_CACHE_MEMO[path] = json.load(fh)
+        except Exception:
+            _BASELINE_CACHE_MEMO[path] = {}
+    hit = _BASELINE_CACHE_MEMO[path].get(_baseline_cache_key(torch_module, task_spec, case))
+    return (float(hit[0]), float(hit[1])) if hit else None
+
+
+def _baseline_cache_put(torch_module, task_spec, case, baseline_ms: float, baseline_full_ms: float) -> None:
+    path = _baseline_cache_path(task_spec)
+    if path is None:
+        return
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        data = {}
+    data[_baseline_cache_key(torch_module, task_spec, case)] = [baseline_ms, baseline_full_ms]
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        return  # read-only bench dir etc. — the cache is an optimization, never a requirement
+    _BASELINE_CACHE_MEMO[path] = data
+
+
 def _benchmark_case(torch_module, task_spec, forward_fn: Callable, backward_fn: Callable, case) -> dict[str, Any]:
     if hasattr(task_spec, "seed_for_case"):
         torch_module.manual_seed(task_spec.seed_for_case(case))
@@ -533,7 +668,15 @@ def _benchmark_case(torch_module, task_spec, forward_fn: Callable, backward_fn: 
     backward_ms = _median_ms_timed_region(setup_saved, backward_from_saved)
     full_step_ms = _median_ms(candidate_full_step)
 
-    if PERFORMANCE_BASELINE == "liger":
+    if PERFORMANCE_BASELINE not in ("liger", "pytorch_autograd"):
+        raise ValueError(
+            f"Unsupported AUTOGRAD_PAIR_PERF_BASELINE={PERFORMANCE_BASELINE!r}; "
+            "expected 'pytorch_autograd' or 'liger'"
+        )
+    cached_baseline = _baseline_cache_get(torch_module, task_spec, case)
+    if cached_baseline is not None:
+        baseline_ms, baseline_full_ms = cached_baseline
+    elif PERFORMANCE_BASELINE == "liger":
         liger_fwd, liger_bwd = _liger_baseline_fns(task_spec)
 
         def liger_setup_saved():
@@ -553,16 +696,13 @@ def _benchmark_case(torch_module, task_spec, forward_fn: Callable, backward_fn: 
         # so both baseline numbers are directly comparable to the candidate's.
         baseline_ms = _median_ms_timed_region(liger_setup_saved, liger_backward_from_saved)
         baseline_full_ms = _median_ms(liger_full_step)
-    elif PERFORMANCE_BASELINE == "pytorch_autograd":
+        _baseline_cache_put(torch_module, task_spec, case, baseline_ms, baseline_full_ms)
+    else:  # pytorch_autograd
         # PyTorch autograd has no clean backward-only split (forward must be redone to
         # get a fresh graph), so the same full fwd+bwd number is used for both.
         baseline_ms = _median_ms(baseline_full_step)
         baseline_full_ms = baseline_ms
-    else:
-        raise ValueError(
-            f"Unsupported AUTOGRAD_PAIR_PERF_BASELINE={PERFORMANCE_BASELINE!r}; "
-            "expected 'pytorch_autograd' or 'liger'"
-        )
+        _baseline_cache_put(torch_module, task_spec, case, baseline_ms, baseline_full_ms)
     saved_byte_count = _saved_bytes(saved_tensors)
     input_byte_count = _input_bytes(_memory_inputs(task_spec, inputs))
     return {
@@ -707,6 +847,7 @@ def _score_from_aggregate(aggregate: dict[str, float]) -> tuple[float, dict[str,
 
 
 def evaluate_autograd_pair_program(program_path: str, task_spec, run_benchmarks: bool = True) -> EvaluationResult:
+    _restore_std_fds()  # heal a redirect leaked by a previous timed-out evaluation
     torch_module, runtime_error = check_runtime()
     if runtime_error:
         return _failure(task_spec, COMPILE_ERROR_SCORE, "RuntimeUnavailable", runtime_error)
@@ -772,6 +913,17 @@ def evaluate_autograd_pair_program(program_path: str, task_spec, run_benchmarks:
         # shapes whose cross-row reduction needs row-tiling — is evolve's job (the `large`
         # specialist), not the seed's. Requiring it here rejects correct seeds for a problem they
         # are not meant to solve yet.
+        #
+        # But every benchmark shape still gets ONE untimed fw+bwd pass: a seed whose kernel
+        # DEADLOCKS on a benchmark-only shape would otherwise wedge evolve (openevolve's eval
+        # timeout abandons the thread, and the orphaned CUDA kernel spins on the GPU forever).
+        # Here the hang happens inside the seed gate's own subprocess, whose timeout-kill tears
+        # the kernel down and rejects the seed. Slow-but-finite is fine; hanging is not.
+        smoke_failure = _smoke_benchmark_shapes(torch_module, task_spec, forward_fn, backward_fn)
+        if smoke_failure is not None:
+            return _result(
+                {"combined_score": CORRECTNESS_ERROR_SCORE, "correct": 0.0, "partial_correctness": 1.0},
+                {"correctness": correctness, "failure": smoke_failure})
         metrics = {"combined_score": 1.0, "correct": 1.0, "partial_correctness": 1.0}
         metrics.update({f"{name}_correct": 1.0 for name in task_spec.OUTPUT_NAMES})
         return _result(metrics, {"correctness": correctness})
@@ -819,5 +971,54 @@ def main(argv: list[str], task_spec, run_benchmarks: bool = True) -> int:
         return 2
 
     result = evaluate_autograd_pair_program(argv[1], task_spec, run_benchmarks=run_benchmarks)
-    print(json.dumps({"metrics": result.metrics, "artifacts": result.artifacts}, indent=2))
+    payload = {"metrics": result.metrics, "artifacts": result.artifacts}
+    # evaluate_isolated() reads the result from this side-channel file — stdout can carry
+    # arbitrary candidate/Triton noise, so it is not a reliable transport for the JSON.
+    result_path = os.environ.get("AUTOGRAD_PAIR_RESULT_JSON")
+    if result_path:
+        with open(result_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+    print(json.dumps(payload, indent=2))
     return 0 if result.metrics.get("correct", 0.0) == 1.0 else 1
+
+
+EVAL_ISOLATION_TIMEOUT = int(os.environ.get("AUTOGRAD_PAIR_EVAL_ISOLATION_TIMEOUT", "850"))
+
+
+def evaluate_isolated(evaluator_file: str, program_path: str, task_spec, timeout: int | None = None) -> EvaluationResult:
+    """Run `evaluator_file PROGRAM_PATH` in a fresh subprocess; SIGKILL it on timeout.
+
+    openevolve's own evaluation timeout merely abandons the worker THREAD — a deadlocked Triton
+    kernel keeps spinning on the GPU forever and wedges every later evaluation on the node.
+    Killing a subprocess destroys its CUDA context, which tears the kernel down with it. (The
+    scaffolded config's max_tasks_per_child=1 was meant to provide this isolation, but Python
+    3.10's ProcessPoolExecutor ignores it.) The default timeout sits just under the scaffolded
+    openevolve evaluator timeout (900s) so the kill happens HERE, where it works.
+    """
+    timeout = timeout or EVAL_ISOLATION_TIMEOUT
+    fd, result_path = tempfile.mkstemp(prefix="autograd_pair_result_", suffix=".json")
+    os.close(fd)
+    env = {**os.environ, "AUTOGRAD_PAIR_RESULT_JSON": result_path}
+    try:
+        try:
+            proc = subprocess.run(
+                [sys.executable, evaluator_file, program_path],
+                capture_output=True, text=True, timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            return _failure(
+                task_spec, CORRECTNESS_ERROR_SCORE, "EvaluationTimeoutKilled",
+                f"evaluation exceeded {timeout}s and was killed (deadlocked/pathological kernel?)")
+        try:
+            with open(result_path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            return _failure(
+                task_spec, COMPILE_ERROR_SCORE, "IsolatedEvalCrashed",
+                f"evaluator subprocess exited rc={proc.returncode} without a result",
+                {"stdout_tail": proc.stdout[-4000:], "stderr_tail": proc.stderr[-4000:]})
+        return EvaluationResult(metrics=payload["metrics"], artifacts=payload.get("artifacts", {}))
+    finally:
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass

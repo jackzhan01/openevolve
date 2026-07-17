@@ -347,6 +347,9 @@ def stage_seed(cfg: OrchestratorConfig, ts) -> int:
            "--evaluator", str(rel / "evaluator_autograd_pair.py"),
            "--model", cfg.model, "--api-base", cfg.api_base,
            "--max-attempts", str(cfg.seed_max_attempts),
+           # The seed gate now smoke-runs every benchmark shape once (deadlock screen), so its
+           # verify subprocess needs headroom beyond the old correctness-only 120s.
+           "--eval-timeout", "300",
            "--pair-api-file", str(api), "--task-context-file", str(ctx)]
     rc = _run(cmd, cfg, b / ".orch_seed.log")
     best = out_dir / "best" / "initial_program_autograd_pair.py"

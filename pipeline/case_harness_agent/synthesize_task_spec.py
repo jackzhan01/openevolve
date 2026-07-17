@@ -140,7 +140,7 @@ Return ONE JSON object with exactly these keys:
   "regime_reason": "one sentence: which reduction in the BACKWARD forces the kernel structure to change",
   "regime_split": <number on that axis: the rule-of-thumb small/large cut>,
   "benchmark_shapes": [[rows, cols], ...],
-  "dtypes": ["float32", "float16", "bfloat16"]
+  "dtypes": ["float32", "float16", "bfloat16"]  // dtypes to SUPPORT (correctness/tolerances); perf timing itself runs bf16-only
 }}
 
 RULES:
@@ -343,13 +343,22 @@ CORRECTNESS_CASES = [
     TestCase(17, 128, "float32", 2e-5, 2e-5),
     TestCase(32, 256, "float16", 5e-2, 5e-2),
     TestCase(64, 512, "float16", 5e-2, 5e-2),
+    TestCase(32, 256, "bfloat16", 8e-2, 8e-2),
+    TestCase(64, 512, "bfloat16", 8e-2, 8e-2),
 ]
+
+# Timing runs on bf16 only: these kernels are memory-bound, so fp16 duplicates bf16's byte
+# width (same perf point twice) and fp32 is not a training dtype — their value is numeric
+# correctness, which CORRECTNESS_CASES already covers on all dtypes. (TritonBench times
+# bf16-only for the same reason.)
+BENCHMARK_DTYPES = ["bfloat16"]
 
 
 def _make_benchmark_cases() -> list[TestCase]:
     cases: list[TestCase] = []
     for rows, cols in _BENCHMARK_SHAPES:
-        for dtype_name, (a, r) in _DTYPE_TOLERANCES.items():
+        for dtype_name in BENCHMARK_DTYPES:
+            a, r = _DTYPE_TOLERANCES.get(dtype_name, (8e-2, 8e-2))
             cases.append(TestCase(rows, cols, dtype_name, a, r))
     return cases
 
@@ -439,7 +448,12 @@ _REDUCED_ATOL = {{"float32": 2e-3, "float16": 2e-1, "bfloat16": 2e-1}}
 
 def atol(case: TestCase, output_name: str) -> float:
     if output_name in _CROSS_ROW_REDUCED_OUTPUTS:
-        return _REDUCED_ATOL.get(case.dtype_name, case.atol_value)
+        # Accumulation noise of a rows-long sum random-walks as sqrt(rows): two CORRECT
+        # implementations that merely accumulate in a different order drift apart by
+        # O(eps * sqrt(rows)). A constant atol therefore over-rejects at 100k+ rows —
+        # scale it with sqrt(rows), anchored at 64 rows (where the base values were tuned).
+        base = _REDUCED_ATOL.get(case.dtype_name, case.atol_value)
+        return base * max(1.0, (case.rows / 64.0) ** 0.5)
     return case.atol_value
 
 

@@ -71,6 +71,10 @@ Triton pitfalls:
   strides as arguments or meta-parameters.
 - Use fp32 accumulation for reductions.
 - Avoid global atomic contention when a partial-buffer reduction is better.
+- NEVER make one block wait on another (spin-loops on flags/counters, grid-wide
+  sync). CUDA does not guarantee co-residency: on large grids that DEADLOCKS.
+  Every candidate is smoke-run once on every benchmark shape and a hang is
+  killed and rejected. Multi-pass reductions must be SEPARATE kernel launches.
 """
 
 
