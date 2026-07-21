@@ -1,7 +1,7 @@
-"""NCU-aware wrapper around the LayerNorm autograd-pair evaluator.
+"""NCU-aware wrapper around the RMSNorm standalone-backward evaluator.
 
 Runs the normal timing-based evaluator first. If the candidate is correct and
-NCU_MODE is not "off", profiles it with `ncu` and returns the hardware metrics
+NCU mode is not "off", profiles it with `ncu` and returns the hardware metrics
 as `ncu_*` keys in the metrics dict plus `ncu_report_path` in artifacts.
 
 The metrics and report path are consumed by the NCU silent optimizer in
@@ -22,7 +22,7 @@ if str(BENCHMARK_DIR) not in sys.path:
 
 import ncu_profile  # noqa: E402
 import task_spec  # noqa: E402
-from evaluator_autograd_pair import evaluate as _base_evaluate  # noqa: E402
+from evaluator import evaluate as _base_evaluate  # noqa: E402
 
 try:
     from openevolve.evaluation_result import EvaluationResult

@@ -57,3 +57,6 @@ tmp/
 # For SR
 secrets.yaml
 problems
+
+ncu-report-skill/
+KernelAgent/

@@ -149,7 +149,10 @@ def _lazy_init_worker_components():
     if _worker_ncu_optimizer is None and getattr(_worker_config, "ncu_enable", False):
         from openevolve.ncu_optimizer import NCUOptimizer
 
-        _worker_ncu_optimizer = NCUOptimizer(llm_ensemble=_worker_llm_ensemble)
+        _worker_ncu_optimizer = NCUOptimizer(
+            llm_ensemble=_worker_llm_ensemble,
+            skip_at_roofline_pct=getattr(_worker_config, "ncu_skip_at_roofline_pct", 95.0),
+        )
 
 
 def _run_iteration_worker(
@@ -307,7 +310,18 @@ def _run_iteration_worker(
             )
 
         # Evaluate the child program
+        import os
         import uuid
+
+        # Toggle NCU profiling per iteration — only NCU-pass iterations pay the
+        # ~20-30s profiling cost. The NCU evaluators read AUTOGRAD_PAIR_NCU_MODE
+        # at call time, so this takes effect immediately. Left untouched when
+        # ncu_enable is false so a manually set NCU_MODE keeps working.
+        if getattr(_worker_config, "ncu_enable", False):
+            _freq = getattr(_worker_config, "ncu_freq", 10)
+            _ncu_iter = _freq > 0 and iteration % _freq == 0
+            os.environ["AUTOGRAD_PAIR_NCU_MODE"] = "always" if _ncu_iter else "off"
+            logger.info(f"[iter {iteration}] NCU profiling {'ON' if _ncu_iter else 'off'} for this iteration")
 
         child_id = str(uuid.uuid4())
         _t_eval = time.time()
@@ -356,6 +370,75 @@ def _run_iteration_worker(
             except Exception as exc:
                 logger.warning(f"[iter {iteration}] failed to save code to {path}: {exc}")
 
+        def _save_ncu_record(
+            outcome: str,
+            optimized: Optional[str],
+            orig_score=None,
+            opt_score=None,
+            hw_delta: Optional[str] = None,
+        ) -> None:
+            """Persist the full NCU-pass record: original kernel, NCU analysis,
+            LLM diagnosis + fix, optimized kernel, scores. One .md per pass in
+            <output_dir>/ncu_passes/ (copied into checkpoints by the controller)."""
+            if not getattr(_worker_config, "log_dir", None):
+                return
+            try:
+                ncu_dir = Path(_worker_config.log_dir).parent / "ncu_passes"
+                ncu_dir.mkdir(parents=True, exist_ok=True)
+
+                roofline_text = getattr(_worker_ncu_optimizer, "last_roofline", None)
+                ncu_section = getattr(_worker_ncu_optimizer, "last_ncu_section", None)
+                diagnosis = getattr(_worker_ncu_optimizer, "last_diagnosis", None)
+                response = getattr(_worker_ncu_optimizer, "last_response", None)
+                # The generation prompt asks for a brief "fixes applied" note
+                # before the final ```python block.
+                gen_plan = (
+                    response.split("```python")[0].strip()
+                    if response
+                    else "(no generation response captured)"
+                )
+
+                def _fmt(v):
+                    return f"{v:.4f}" if isinstance(v, (int, float)) else "n/a"
+
+                record = "\n".join(
+                    [
+                        f"# NCU pass — iteration {iteration}",
+                        f"- time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                        f"- outcome: {outcome}",
+                        f"- original combined_score: {_fmt(orig_score)}",
+                        f"- optimized combined_score: {_fmt(opt_score)}",
+                        f"- hardware delta: {hw_delta or 'n/a'}",
+                        "",
+                        "## 0. Roofline triage (deterministic)",
+                        roofline_text or "(not captured)",
+                        "",
+                        "## 1. Original kernel",
+                        "```python",
+                        child_code,
+                        "```",
+                        "",
+                        "## 2. NCU analysis (as shown to the LLM)",
+                        ncu_section or "(not captured)",
+                        "",
+                        "## 3. LLM diagnosis — bottlenecks, root causes, fixes",
+                        diagnosis or "(no diagnosis captured)",
+                        "",
+                        "## 4. Generation — fixes applied",
+                        gen_plan,
+                        "",
+                        "## 5. Optimized kernel",
+                        "```python",
+                        optimized if optimized else f"(none — {outcome})",
+                        "```",
+                        "",
+                    ]
+                )
+                (ncu_dir / f"iter_{iteration:04d}.md").write_text(record, encoding="utf-8")
+                logger.info(f"[iter {iteration}] NCU pass record saved to {ncu_dir}/iter_{iteration:04d}.md")
+            except Exception as exc:
+                logger.warning(f"[iter {iteration}] failed to save NCU pass record: {exc}")
+
         # NCU silent optimization pass — runs independently of the evolver
         ncu_freq = getattr(_worker_config, "ncu_freq", 10)
         ncu_pass_conditions = {
@@ -371,14 +454,20 @@ def _run_iteration_worker(
             logger.info(f"[iter {iteration}] NCU optimization pass — calling LLM ...")
             logger.debug("NCU optimizer — original code\n=== ORIGINAL CODE ===\n%s", child_code)
             _save_code(child_code, "_ncu_original")
-            ncu_optimizer_timeout = getattr(_worker_config, "ncu_optimizer_timeout", 180)
+            ncu_optimizer_timeout = getattr(_worker_config, "ncu_optimizer_timeout", 360)
 
             async def _ncu_optimize_with_timeout():
                 return await asyncio.wait_for(
-                    _worker_ncu_optimizer.optimize(child_code, ncu_metrics, ncu_report_path),
+                    _worker_ncu_optimizer.optimize(
+                        child_code,
+                        ncu_metrics,
+                        ncu_report_path,
+                        benchmark_metrics=child_metrics,
+                    ),
                     timeout=ncu_optimizer_timeout,
                 )
 
+            ncu_timed_out = False
             try:
                 optimized_code = asyncio.run(_ncu_optimize_with_timeout())
             except asyncio.TimeoutError:
@@ -386,6 +475,7 @@ def _run_iteration_worker(
                     f"[iter {iteration}] NCU optimizer LLM call timed out after {ncu_optimizer_timeout}s — skipping pass"
                 )
                 optimized_code = None
+                ncu_timed_out = True
             if optimized_code:
                 logger.info(f"[iter {iteration}] NCU: LLM returned optimized code ({len(optimized_code)} chars) — re-evaluating ...")
                 logger.debug("NCU optimizer — generated code\n=== OPTIMIZED CODE ===\n%s", optimized_code)
@@ -397,6 +487,17 @@ def _run_iteration_worker(
                     f"(correct={opt_metrics_raw.get('correct', 0):.0f})"
                 )
                 opt_metrics = {k: v for k, v in opt_metrics_raw.items() if not k.startswith("ncu_")}
+
+                # Hardware before/after — did the fix work for the stated reason?
+                delta_str = None
+                opt_ncu = {k: v for k, v in opt_metrics_raw.items() if k.startswith("ncu_")}
+                if opt_ncu:
+                    delta_str = ", ".join(
+                        f"{k[4:]}: {ncu_metrics[k]:.2f} → {opt_ncu[k]:.2f}"
+                        for k in sorted(ncu_metrics)
+                        if k in opt_ncu and isinstance(ncu_metrics[k], (int, float))
+                    )
+                    logger.info(f"[iter {iteration}] NCU hardware delta — {delta_str}")
 
                 orig_score = child_metrics.get("combined_score", safe_numeric_average(child_metrics))
                 opt_score = opt_metrics.get("combined_score", safe_numeric_average(opt_metrics))
@@ -411,6 +512,9 @@ def _run_iteration_worker(
                         f"{orig_score:.4f} → {opt_score:.4f} (Δ={opt_score - orig_score:+.4f}); replacing child silently"
                     )
                     _save_code(optimized_code, "_ncu_improved")
+                    _save_ncu_record(
+                        "improved — replaced child", optimized_code, orig_score, opt_score, delta_str
+                    )
                     final_code = optimized_code
                     final_metrics = opt_metrics
                     # Swap artifacts to the optimized program's artifacts
@@ -420,8 +524,19 @@ def _run_iteration_worker(
                         f"[iter {iteration}] NCU optimizer did not improve: "
                         f"original={orig_score:.4f} optimized={opt_score:.4f}; keeping original"
                     )
+                    _save_ncu_record(
+                        "not improved — kept original", optimized_code, orig_score, opt_score, delta_str
+                    )
             else:
-                logger.info(f"[iter {iteration}] NCU optimizer returned no change")
+                _skip_reason = getattr(_worker_ncu_optimizer, "last_skip_reason", None)
+                if ncu_timed_out:
+                    _outcome = "optimizer timed out"
+                elif _skip_reason:
+                    _outcome = f"skipped — {_skip_reason}"
+                else:
+                    _outcome = "no change returned (LLM kept code or parse failed)"
+                logger.info(f"[iter {iteration}] NCU optimizer: {_outcome}")
+                _save_ncu_record(_outcome, None)
 
         # Save the final iteration code (post-NCU-pass if applicable)
         _save_code(final_code, "")
@@ -532,6 +647,7 @@ class ProcessParallelController:
             "ncu_enable": config.ncu_enable,
             "ncu_freq": config.ncu_freq,
             "ncu_optimizer_timeout": config.ncu_optimizer_timeout,
+            "ncu_skip_at_roofline_pct": config.ncu_skip_at_roofline_pct,
         }
 
     def start(self) -> None:
@@ -644,7 +760,7 @@ class ProcessParallelController:
             ncu_extra = (
                 self.config.llm.timeout
                 + self.config.evaluator.timeout
-                + getattr(self.config, "ncu_optimizer_timeout", 90)
+                + getattr(self.config, "ncu_optimizer_timeout", 360)
             )
         timeout_seconds = self.config.evaluator.timeout + 30 + ncu_extra
 
